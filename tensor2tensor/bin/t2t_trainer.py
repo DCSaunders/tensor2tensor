@@ -56,6 +56,7 @@ flags.DEFINE_bool("generate_data", False, "Generate data before training?")
 flags.DEFINE_string("tmp_dir", "/tmp/t2t_datagen",
                     "Temporary storage directory, used if --generate_data.")
 flags.DEFINE_bool("profile", False, "Profile performance?")
+flags.DEFINE_string("raw_data_dir", "/home/centos/data", "Location of input raw data.")
 
 # To maintain compatibility with some internal libs, we guard against these flag
 # definitions possibly erroring. Apologies for the ugliness.
@@ -149,7 +150,8 @@ def create_run_config(hp):
       worker_id=FLAGS.worker_id,
       worker_job=FLAGS.worker_job,
       random_seed=FLAGS.random_seed,
-      tpu_infeed_sleep_secs=FLAGS.tpu_infeed_sleep_secs)
+      tpu_infeed_sleep_secs=FLAGS.tpu_infeed_sleep_secs,
+      log_step_count_steps=FLAGS.log_step_count_steps,)
 
 
 def generate_data():
