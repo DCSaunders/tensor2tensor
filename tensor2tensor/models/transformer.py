@@ -245,7 +245,10 @@ class Transformer(t2t_model.T2TModel):
   def _minimum_risk_sample(self, features=None, decode_length=5):
     hparams = self._hparams
     target_modality = self._problem_hparams.target_modality
-    decode_length = common_layers.shape_list(features["targets"])[1] + decode_length
+    if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
+      decode_length = common_layers.shape_list(features["targets"])[1] + decode_length
+    else:
+      decode_length = common_layers.shape_list(features["inputs"])[1] + decode_length
     encoder_output, encoder_decoder_attention_bias = self._initialize_cache(
       features, getting_samples=True)
     sample_num = hparams.mrt_sample_num
@@ -494,7 +497,7 @@ def fast_decode(encoder_output,
   cache["encoder_output"] = encoder_output
   cache["encoder_decoder_attention_bias"] = encoder_decoder_attention_bias
 
-  if beam_size > 1:  # Beam Search
+  if beam_size >= 1:  # Beam Search
     initial_ids = tf.zeros([batch_size], dtype=tf.int32)
     decoded_ids, scores = beam_search.beam_search(
         symbols_to_logits_fn,
@@ -526,7 +529,7 @@ def fast_decode(encoder_output,
       return (i < decode_length) & tf.logical_not(tf.reduce_all(finished))
     
     decoded_ids = tf.zeros([batch_size, 0], dtype=tf.int64)
-    finished = tf.constant(False, shape=[batch_size])
+    finished = tf.zeros([batch_size], tf.bool)
     next_id = tf.zeros([batch_size, 1], dtype=tf.int64)
     _, _, _, decoded_ids, _ = tf.while_loop(
         is_not_finished,
@@ -552,8 +555,10 @@ def fast_sample(cache,
                 vocab_size,
                 sample_num,
                 eos_id=beam_search.EOS_ID):
+  batch_pos = beam_search.compute_batch_indices(batch_size, sample_num)
+  sample_pos = tf.tile([tf.range(sample_num)], [batch_size, 1])
 
-  def inner_loop(i, finished, next_id, decoded_ids, cache):
+  def inner_loop(i, finished, next_id, decoded_ids, log_probs, cache):
     flat_ids = tf.reshape(next_id, [batch_size * sample_num, -1])
     flat_cache = nest.map_structure(beam_search._merge_beam_dim, cache)
     flat_logits, flat_cache = symbols_to_logits_fn(flat_ids, i, flat_cache)
@@ -561,37 +566,45 @@ def fast_sample(cache,
           lambda t: beam_search._unmerge_beam_dim(t, batch_size, sample_num), flat_cache)
     flat_next_id = common_layers.sample_with_temperature(flat_logits, hparams.sampling_temp)
     next_id = tf.reshape(flat_next_id, [batch_size, sample_num])
+    logits = tf.reshape(flat_logits, [batch_size, sample_num, -1]) 
+    log_prob_norm = tf.reduce_logsumexp(logits, axis=2)
+    scores_to_gather = tf.stack([batch_pos, sample_pos, tf.to_int32(next_id)], axis=2)
+    sample_logits = tf.gather_nd(logits, scores_to_gather)
+    log_probs += (sample_logits - log_prob_norm)
     finished |= tf.equal(next_id, eos_id)
     decoded_ids = tf.concat([decoded_ids, tf.expand_dims(next_id, 2)], 2)
-    return i + 1, finished, next_id, decoded_ids, cache
+    return i + 1, finished, next_id, decoded_ids, log_probs, cache
 
   def is_not_finished(i, finished, *_):
     return (i < decode_length) & tf.logical_not(tf.reduce_all(finished))
 
   tf.logging.info('Beginning minimum risk sampling')
   # cache already tiled by calling function
+  log_probs = tf.zeros([batch_size, sample_num], dtype=tf.float32)
   finished = tf.zeros([batch_size, sample_num], dtype=tf.bool)
   next_id = beam_search._expand_to_beam_size(tf.zeros([batch_size], dtype=tf.int64),
                                              sample_num)
   decoded_ids = tf.zeros([batch_size, sample_num, 0], dtype=tf.int64)
 
 
-  _, _, _, decoded_ids, _ = tf.while_loop(
+  _, _, _, decoded_ids, log_probs,  _ = tf.while_loop(
     is_not_finished,
     inner_loop,
-    [tf.constant(0), finished, next_id, decoded_ids, cache],
+    [tf.constant(0), finished, next_id, decoded_ids, log_probs, cache],
     shape_invariants=[
       tf.TensorShape([]),
       tf.TensorShape([None, sample_num]),
       tf.TensorShape([None, sample_num]),
       tf.TensorShape([None, sample_num, None]),
+      tf.TensorShape([None, sample_num]),
             nest.map_structure(beam_search.get_state_shape_invariants, cache),
         ],
     back_prop=False)
   pad_len = decode_length - common_layers.shape_list(decoded_ids)[2]
   padded_decoded_ids = tf.pad(decoded_ids, [[0, 0], [0, 0], [0, pad_len]])
+  scores = None
+  return {"outputs": padded_decoded_ids, "scores": log_probs}
 
-  return padded_decoded_ids
 
 
 @registry.register_model

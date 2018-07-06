@@ -126,7 +126,7 @@ def decode_from_dataset(estimator,
     problem = hparams.problem_instances[problem_idx]
     infer_input_fn = problem.make_estimator_input_fn(
         tf.estimator.ModeKeys.PREDICT, hparams, dataset_kwargs=dataset_kwargs)
-
+    
     # Get the predictions as an iterable
     predictions = estimator.predict(infer_input_fn)
 

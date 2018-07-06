@@ -193,9 +193,10 @@ class T2TModel(base.Layer):
   def model_fn(self, features):
     original_features = features
     transformed_features = self.bottom(features)
-    get_minimum_risk_samples = (not self.mrt_called and 
-                                self.hparams.mode == tf.estimator.ModeKeys.TRAIN and
-                                self.hparams.minimum_risk_train)
+    get_minimum_risk_samples = (
+      not self.mrt_called and 
+      self.hparams.mode != tf.estimator.ModeKeys.EVAL and
+      self.hparams.minimum_risk_train)
     with tf.variable_scope("body"):
       tf.logging.info("Building model body")
       body_out = self.body(transformed_features)
@@ -236,10 +237,11 @@ class T2TModel(base.Layer):
     target_modality = self._problem_hparams.target_modality
 
     with tf.variable_scope(target_modality.name):
-      tf.logging.info("Transforming 'targets' with %s.targets_bottom",
-                      target_modality.name)
-      transformed_features["targets"] = target_modality.targets_bottom(
-          features["targets"])
+      if features["targets"] is not None:
+        tf.logging.info("Transforming 'targets' with %s.targets_bottom",
+                        target_modality.name)
+        transformed_features["targets"] = target_modality.targets_bottom(
+            features["targets"])
 
     for key in features:
       if key not in transformed_features:
@@ -382,14 +384,19 @@ class T2TModel(base.Layer):
     orig_features: untransformed features
     orig_losses: dictionary of losses from first forward pass
     """
+    tf.logging.info('Carrying out minimum risk sampling')
     assert self.hparams.sampling_method == "random"
     decode_length = self.hparams.mrt_decode_length
-    samples = self._minimum_risk_sample(transformed_features, decode_length=decode_length)
+    results = self._minimum_risk_sample(transformed_features, decode_length=decode_length)
+    if self.hparams.mode != tf.estimator.ModeKeys.TRAIN:
+      self.mrt_results = copy.copy(results)
+      results["scores"] = {"samples": results["scores"]}
+      return results["outputs"], results["scores"]
+    samples = results["outputs"]
     orig_targets = tf.squeeze(orig_features['targets'], [2, 3])
     sample_count, samples = self._maybe_add_ref(samples, orig_targets)
     bleus = tf.py_func(self._get_sentence_bleu, [samples, orig_targets], tf.float32)
-    logits, losses =  self._forward_pass_samples(orig_features, samples, bleus, sample_count, 
-                                                 orig_losses)
+    logits, losses =  self._forward_pass_samples(orig_features, samples, bleus, sample_count, orig_losses)
     return logits, losses
   
   def _trim_eos_samples(self, samples):
@@ -441,9 +448,11 @@ class T2TModel(base.Layer):
     if len(loss_num.get_shape())> 1:
       loss_num = tf.reduce_sum(loss_num, axis=1)
       loss_num = tf.squeeze(loss_num)
-    loss_num *= bleus * self.hparams.mrt_alpha
-    loss_den *= (sample_count - 1)
-    losses['training'] = (tf.reduce_sum(loss_num), loss_den)
+    if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
+      loss_num *= bleus * self.hparams.mrt_alpha
+      loss_den *= (sample_count - 1)
+      loss_num = tf.reduce_sum(loss_num)
+    losses['training'] = (loss_num, loss_den)
     return losses
 
 
@@ -562,14 +571,20 @@ class T2TModel(base.Layer):
         target_modality = self._problem_hparams.target_modality
         if target_modality.is_class_modality:
           beam_size = 1  # No use to run beam-search for a single class.
-      if beam_size == 1:
+      if self.hparams.minimum_risk_train:
+        tf.logging.info('Sampling')
+        old_inputs = features['inputs']
+        features['targets'] = features['infer_targets']
+        self(features)  # pylint: disable=not-callable
+        results = self.mrt_results
+        features['inputs'] = old_inputs
+      elif beam_size == 1:
         tf.logging.info("Greedy Decoding")
         results = self._greedy_infer(features, decode_length)
       else:
         tf.logging.info("Beam Decoding with beam size %d" % beam_size)
         results = self._beam_decode(
             features, decode_length, beam_size, top_beams, alpha)
-
       return results
 
   def _beam_decode(self, features, decode_length, beam_size, top_beams, alpha, back_prop=False):
