@@ -228,16 +228,17 @@ class T2TModel(base.Layer):
         self._problem_hparams.input_modality):
       do_reuse = input_modality.name in all_previous_modalities
       with tf.variable_scope(input_modality.name, reuse=do_reuse):
-        tf.logging.info("Transforming feature '%s' with %s.bottom", key,
-                        input_modality.name)
-        transformed_features[key] = input_modality.bottom(features[key])
+        if key in features:
+          tf.logging.info("Transforming feature '%s' with %s.bottom", key,
+                          input_modality.name)
+          transformed_features[key] = input_modality.bottom(features[key])
       all_previous_modalities.append(input_modality.name)
 
     # Transform the targets (for autoregressive models)
     target_modality = self._problem_hparams.target_modality
 
     with tf.variable_scope(target_modality.name):
-      if features["targets"] is not None:
+      if 'targets' in features and features["targets"] is not None:
         tf.logging.info("Transforming 'targets' with %s.targets_bottom",
                         target_modality.name)
         transformed_features["targets"] = target_modality.targets_bottom(
@@ -574,7 +575,12 @@ class T2TModel(base.Layer):
       if self.hparams.minimum_risk_train:
         tf.logging.info('Sampling')
         old_inputs = features['inputs']
-        features['targets'] = features['infer_targets']
+        if "inputs" in features and len(features["inputs"].shape) < 4:
+          features["inputs"] = tf.expand_dims(features["inputs"], -1)
+        if 'infer_targets' in features:
+          features['targets'] = features['infer_targets']
+        else:
+          features['targets'] = features['inputs']
         self(features)  # pylint: disable=not-callable
         results = self.mrt_results
         features['inputs'] = old_inputs
