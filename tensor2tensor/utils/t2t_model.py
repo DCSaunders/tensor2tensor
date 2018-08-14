@@ -111,6 +111,7 @@ class T2TModel(base.Layer):
         hparams.shared_embedding_and_softmax_weights = 0
     self._original_hparams = hparams
     self.set_mode(mode)
+    self.sentence_pairs_seen = 0
     self.mrt_called = False
     self._decode_hparams = copy.copy(decode_hparams or
                                      decoding.decode_hparams())
@@ -191,16 +192,18 @@ class T2TModel(base.Layer):
     return sharded_logits, losses
 
   def model_fn(self, features):
-    original_features = features
+    original_features = copy.copy(features)
     transformed_features = self.bottom(features)
     get_minimum_risk_samples = (
       not self.mrt_called and 
-      self.hparams.mode != tf.estimator.ModeKeys.EVAL and
+   #   self.hparams.mode != tf.estimator.ModeKeys.EVAL and
       self.hparams.minimum_risk_train)
     with tf.variable_scope("body"):
       tf.logging.info("Building model body")
       body_out = self.body(transformed_features)
     output, losses = self._normalize_body_output(body_out)
+    if self.hparams.log_sentence_pairs_seen:
+      self.log_sentences(losses, original_features['inputs'])
     if "training" in losses:
       tf.logging.info("Skipping T2TModel top and loss because training loss "
                       "returned from body")
@@ -213,6 +216,16 @@ class T2TModel(base.Layer):
       logits, losses = self.minimum_risk_training(transformed_features, original_features,
                                                   losses)
     return logits, losses
+
+  def log_sentences(self, losses, inputs):
+    sentence_log = tf.py_func(self.count_sentences, [inputs, tf.train.get_or_create_global_step()], tf.float32)
+    losses['extra'] += tf.reshape(sentence_log, ())
+    
+  def count_sentences(self, inputs, step):
+    self.sentence_pairs_seen += len(inputs)
+    if step % self.hparams.log_sentences_step == 0:
+      tf.logging.info('Step {}, seen {} sentence pairs total'.format(step, self.sentence_pairs_seen))
+    return np.float32(0.0)
 
   def bottom(self, features):
     """Transform features to feed into body."""
@@ -378,6 +391,14 @@ class T2TModel(base.Layer):
     """Called before inference to allow adding infer-specific features."""
     pass
 
+  def hacky_print(self, t):
+    tf.logging.info(t)
+    return np.float32(t)
+
+  def do_hacky_print(self, tensor_to_log):
+    unchanged = tf.py_func(self.hacky_print, [tensor_to_log], tf.float32)
+    return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
+
   def minimum_risk_training(self, transformed_features, orig_features, orig_losses):
     """
     args:
@@ -386,10 +407,9 @@ class T2TModel(base.Layer):
     orig_losses: dictionary of losses from first forward pass
     """
     tf.logging.info('Carrying out minimum risk sampling')
-    assert self.hparams.sampling_method == "random"
     decode_length = self.hparams.mrt_decode_length
     results = self._minimum_risk_sample(transformed_features, decode_length=decode_length)
-    if self.hparams.mode != tf.estimator.ModeKeys.TRAIN:
+    if self.hparams.mode == tf.estimator.ModeKeys.PREDICT:
       self.mrt_results = copy.copy(results)
       results["scores"] = {"samples": results["scores"]}
       return results["outputs"], results["scores"]
@@ -398,6 +418,7 @@ class T2TModel(base.Layer):
     sample_count, samples = self._maybe_add_ref(samples, orig_targets)
     bleus = tf.py_func(self._get_sentence_bleu, [samples, orig_targets], tf.float32)
     logits, losses =  self._forward_pass_samples(orig_features, samples, bleus, sample_count, orig_losses)
+    #losses['tmp'] = self.do_hacky_print(results["scores"])
     return logits, losses
   
   def _trim_eos_samples(self, samples):
@@ -408,33 +429,65 @@ class T2TModel(base.Layer):
     for sample_batch in samples:
       trimmed_batch = []
       for sample in sample_batch:
-        hyp = decoding._save_until_eos(sample, is_image=False)
+        hyp = decoding._save_until_eos(sample, is_image=False) + [text_encoder.EOS_ID]
         padded_hyp = np.pad(hyp, [0, max_len - len(hyp)], 'constant')
         trimmed_batch.append(padded_hyp)
       trimmed_samples.append(trimmed_batch)
     return np.asarray(trimmed_samples, dtype=np.int32)
 
   def _maybe_add_ref(self, samples, orig_targets):
-    samples = tf.py_func(self._trim_eos_samples, [samples], tf.int32)
-    sample_count = self.hparams.mrt_sample_num
-    target_shape = common_layers.shape_list(orig_targets)
-    samples = tf.reshape(samples, [target_shape[0], sample_count, -1])
-    if self.hparams.mrt_use_ref_score:
-      padded_target = tf.pad(orig_targets, [[0, 0], [0, self.hparams.mrt_decode_length]])
-      samples = tf.concat([samples, tf.expand_dims(padded_target, axis=1)], axis=1)
-      sample_count += 1
+    if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
+      samples = tf.py_func(self._trim_eos_samples, [samples], tf.int32)
+      sample_count = self.hparams.mrt_sample_num
+      target_shape = common_layers.shape_list(orig_targets)
+      samples = tf.reshape(samples, [target_shape[0], sample_count, -1])
+      if self.hparams.mrt_use_ref_score:
+        padded_target = tf.pad(orig_targets, [[0, 0], [0, self.hparams.mrt_decode_length]])
+        samples = tf.concat([samples, tf.expand_dims(padded_target, axis=1)], axis=1)
+        sample_count += 1
+    else:
+      sample_count = 1
     return sample_count, samples
 
   def _forward_pass_samples(self, features, samples, bleus, sample_count, orig_losses):
     """
     Repeat forward pass, now using samples as the 'reference' targets
-    NB: this assumes that the encoded inputs have been cached and tiled by the model
     """
+    tf.logging.info('Repeating forward pass for MRT')
+    if self.hparams.mode == tf.estimator.ModeKeys.EVAL:
+      sample_count = 1
+    t = beam_search._expand_to_beam_size(features['inputs'], sample_count)
+    features['inputs'] = beam_search._merge_beam_dim(t)
+
     flat_samples = beam_search._merge_beam_dim(samples)
+    weights = common_layers.weights_nonzero(flat_samples)
     flat_samples = tf.expand_dims(tf.expand_dims(flat_samples, -1), -1)
     features['targets'] = flat_samples
     logits, losses = self.model_fn(features) # shape [batch_size * sample_num]
-    losses = self.adjust_mrt_loss(losses, bleus, sample_count)
+
+
+    '''
+    # logits have shape [batch, p0, p1, ?, vocab_size]
+    target_shape = common_layers.shape_list(flat_samples)
+    batch_size = target_shape[0]
+    timesteps = target_shape[1]
+    reshaped_logits = tf.reshape(logits, [batch_size, timesteps, -1])
+    log_prob_norm = tf.reduce_logsumexp(reshaped_logits, axis=2)
+    ids = tf.reshape(flat_samples, [batch_size, -1, 1])
+    batch_ids = tf.expand_dims(beam_search.compute_batch_indices(batch_size, timesteps), -1)
+    pos_ids = tf.reshape(tf.tile(tf.expand_dims(tf.range(timesteps), -1), [batch_size, 1]), 
+                          [batch_size, -1, 1])
+    gather_ids = tf.concat([batch_ids, pos_ids, ids], axis=2)
+    sentence_tok_log_probs = tf.gather_nd(reshaped_logits, gather_ids) - log_prob_norm # shape: [batch_size, timesteps]
+    losses['training'] = (sentence_tok_log_probs * weights, 1.0)
+    '''
+
+
+    losses['training'] = (tf.squeeze(tf.reduce_sum(losses['training'][0], axis=1)),
+                          tf.reduce_sum(losses['training'][1]))
+
+    if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
+      losses = self.adjust_mrt_loss(losses, bleus, sample_count)
     if self.hparams.mrt_add_ref_xentropy:
       orig_loss = orig_losses['training']
       new_loss = losses['training']
@@ -446,13 +499,12 @@ class T2TModel(base.Layer):
   def adjust_mrt_loss(self, losses, bleus, sample_count):
     loss_num, loss_den = losses['training']
     loss_den = tf.reduce_sum(loss_den)
-    if len(loss_num.get_shape())> 1:
-      loss_num = tf.reduce_sum(loss_num, axis=1)
-      loss_num = tf.squeeze(loss_num)
+    loss_shape = common_layers.shape_list(loss_num)
+    bleus = tf.reshape(bleus, loss_shape)
     if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
       loss_num *= bleus * self.hparams.mrt_alpha
       loss_den *= (sample_count - 1)
-      loss_num = tf.reduce_sum(loss_num)
+      loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
     losses['training'] = (loss_num, loss_den)
     return losses
 
@@ -467,6 +519,7 @@ class T2TModel(base.Layer):
         matches_by_order = max_order * [0]
         ref_ngrams_by_order = max_order * [0]
         hyp = decoding._save_until_eos(sample, is_image=False)
+        #tf.logging.info('SAMPLE {} TARGET {}'.format(hyp, ref))
         self._get_ngram_matches(hyp, ref, matches_by_order, ref_ngrams_by_order, max_order)
         smooth = 1.0
         for i in xrange(max_order):
@@ -481,15 +534,17 @@ class T2TModel(base.Layer):
           ratio = max(len(hyp), 1) / len(ref)
           bp = math.exp(1 - 1. / ratio) if ratio < 1.0 else 1.0
           bleu *= bp
-        if self.hparams.mrt_use_negative_loss:
-          bleu = -bleu
-        else:
-          bleu = 1 - bleu
+        if not self.hparams.mrt_subtract_av_bleu:
+          if self.hparams.mrt_use_negative_bleu:
+            bleu = -bleu
+          elif self.hparams.mrt_zero_bleu_high:
+            bleu = 1 - bleu
         batch_bleus.append(bleu)
       if self.hparams.mrt_subtract_av_bleu:
         sentence_bleus.append(batch_bleus - np.mean(batch_bleus))
       else:
         sentence_bleus.append(batch_bleus)
+      #tf.logging.info(sentence_bleus[-1])
     return np.asarray(sentence_bleus, dtype=np.float32)
 
     
@@ -572,7 +627,7 @@ class T2TModel(base.Layer):
         target_modality = self._problem_hparams.target_modality
         if target_modality.is_class_modality:
           beam_size = 1  # No use to run beam-search for a single class.
-      if self.hparams.minimum_risk_train:
+      if self.hparams.minimum_risk_train and self.hparams.mrt_sample_during_eval:
         tf.logging.info('Sampling')
         old_inputs = features['inputs']
         if "inputs" in features and len(features["inputs"].shape) < 4:
@@ -986,11 +1041,17 @@ class T2TModel(base.Layer):
     # PREDICT mode
     if mode == tf.estimator.ModeKeys.PREDICT:
       assert not use_tpu
+      tf.logging.info('Running prediction')
       return model.estimator_spec_predict(features)
 
+
     # TRAIN and EVAL modes
-    if hparams.eval_run_autoregressive and mode == tf.estimator.ModeKeys.EVAL:
-      logits, losses_dict = model.eval_autoregressive(features)
+    eval_autoregressive = (hparams.eval_run_autoregressive and mode == tf.estimator.ModeKeys.EVAL)
+    if eval_autoregressive and not hparams.minimum_risk_train:
+      tf.logging.info('Running autoregressive evaluation')
+      autoregressive_out = model.eval_autoregressive(features)
+      logits = autoregressive_out['logits']
+      losses_dict = autoregressive_out['losses']
     else:
       logits, losses_dict = model(features)  # pylint: disable=not-callable
 
@@ -1012,7 +1073,6 @@ class T2TModel(base.Layer):
 
     # Accumulate losses
     loss = sum(losses_dict.values())
-
     train_loss_logger = None
     if hparams.log_all_training_losses:
       tf.logging.info('Adding the following loss subsets to training hooks: {}'.format(
@@ -1051,7 +1111,6 @@ class T2TModel(base.Layer):
   def estimator_spec_eval(self, features, logits, labels, loss):
     """Construct EstimatorSpec for EVAL mode."""
     hparams = self.hparams
-
     if not hasattr(hparams, "problem_instances"):
       raise NotImplementedError(_no_problem_err("estimator_spec_eval"))
 

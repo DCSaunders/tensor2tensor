@@ -68,19 +68,18 @@ class Transformer(t2t_model.T2TModel):
               encodre-decoder attention. [batch_size, input_length]
     """
     inputs = common_layers.flatten4d3d(inputs)
-
     encoder_input, self_attention_bias, encoder_decoder_attention_bias = (
         transformer_prepare_encoder(
             inputs, target_space, hparams, features=features))
 
     encoder_input = tf.nn.dropout(encoder_input,
                                   1.0 - hparams.layer_prepostprocess_dropout)
-
+    
     encoder_output = transformer_encoder(
         encoder_input, self_attention_bias,
         hparams, nonpadding=features_to_nonpadding(features, "inputs"),
         save_weights_to=self.attention_weights)
-
+    
     return encoder_output, encoder_decoder_attention_bias
 
   def decode(self,
@@ -216,12 +215,14 @@ class Transformer(t2t_model.T2TModel):
     else:
       tf.logging.info('getting encoding from cache')
       t = self.mrt_cache[label]
-    if self.mrt_called:
+    if self.mrt_called and getting_samples:
       tile_num = self.hparams.mrt_sample_num
       tf.logging.info('tiling encoding')
       if self.hparams.mrt_use_ref_score and not getting_samples:
         tf.logging.info('increasing tiling to use ref')
         tile_num = self.hparams.mrt_sample_num + 1
+      if self.hparams.mode == tf.estimator.ModeKeys.EVAL:
+        tile_num = 1
       t = beam_search._expand_to_beam_size(t, tile_num)
       if not getting_samples:
         t = beam_search._merge_beam_dim(t)
@@ -229,12 +230,10 @@ class Transformer(t2t_model.T2TModel):
 
   def _initialize_cache(self, features, getting_samples=False):
     enc_out, enc_dec_attn_bias = (None, None)
-    if not self.mrt_cache:
-        tf.logging.info('getting encoding for the first time')
-        enc_out, enc_dec_attn_bias = self.encode(features["inputs"],
-                                                 features["target_space_id"],
-                                                 self._hparams,
-                                                 features=features)
+    enc_out, enc_dec_attn_bias = self.encode(features["inputs"],
+                                             features["target_space_id"],
+                                             self._hparams,
+                                             features=features)
     enc_out = self._maybe_tile_encoding(enc_out, 'encoder_output', getting_samples)
     enc_dec_attn_bias = self._maybe_tile_encoding(enc_dec_attn_bias,
                                                   'encoder_decoder_attention_bias',
@@ -249,10 +248,12 @@ class Transformer(t2t_model.T2TModel):
       decode_length = common_layers.shape_list(features["targets"])[1] + decode_length
     else:
       decode_length = common_layers.shape_list(features["inputs"])[1] + decode_length
-    encoder_output, encoder_decoder_attention_bias = self._initialize_cache(
+    with tf.variable_scope("body"):
+      encoder_output, encoder_decoder_attention_bias = self._initialize_cache(
       features, getting_samples=True)
     sample_num = hparams.mrt_sample_num
-
+    if self.hparams.mode == tf.estimator.ModeKeys.EVAL:
+      sample_num = 1
     if hparams.pos == "timing":
       timing_signal = common_attention.get_timing_signal_1d(
         decode_length + 1, hparams.hidden_size)
@@ -519,6 +520,7 @@ def fast_decode(encoder_output,
       logits, cache = symbols_to_logits_fn(next_id, i, cache)
       temperature = (0.0 if hparams.sampling_method == "argmax" else
                      hparams.sampling_temp)
+      tf.logging.info('Using temperature {} for decoding'.format(temperature))
       next_id = common_layers.sample_with_temperature(logits, temperature)
       finished |= tf.equal(next_id, eos_id)
       next_id = tf.expand_dims(next_id, axis=1)
@@ -547,6 +549,14 @@ def fast_decode(encoder_output,
   return {"outputs": decoded_ids, "scores": scores}
 
 
+def hacky_print(t):
+  tf.logging.info(t)
+  return t
+
+def do_hacky_print(tensor_to_log):
+  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
+  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
+
 def fast_sample(cache,
                 batch_size,
                 symbols_to_logits_fn,
@@ -557,20 +567,25 @@ def fast_sample(cache,
                 eos_id=beam_search.EOS_ID):
   batch_pos = beam_search.compute_batch_indices(batch_size, sample_num)
   sample_pos = tf.tile([tf.range(sample_num)], [batch_size, 1])
+  temperature = hparams.sampling_temp
+  if sample_num == 1:
+    tf.logging.info('Taking 1best sample per sentence')
+    temperature = 0.0
 
   def inner_loop(i, finished, next_id, decoded_ids, log_probs, cache):
     flat_ids = tf.reshape(next_id, [batch_size * sample_num, -1])
     flat_cache = nest.map_structure(beam_search._merge_beam_dim, cache)
     flat_logits, flat_cache = symbols_to_logits_fn(flat_ids, i, flat_cache)
+    
     cache = nest.map_structure(
           lambda t: beam_search._unmerge_beam_dim(t, batch_size, sample_num), flat_cache)
-    flat_next_id = common_layers.sample_with_temperature(flat_logits, hparams.sampling_temp)
-    next_id = tf.reshape(flat_next_id, [batch_size, sample_num])
+    flat_next_id = common_layers.sample_with_temperature(flat_logits, temperature)
+    next_id = tf.reshape(flat_next_id, [batch_size, sample_num]) #+ tf.cast(do_hacky_print(flat_logits), tf.int64)
     logits = tf.reshape(flat_logits, [batch_size, sample_num, -1]) 
     log_prob_norm = tf.reduce_logsumexp(logits, axis=2)
     scores_to_gather = tf.stack([batch_pos, sample_pos, tf.to_int32(next_id)], axis=2)
     sample_logits = tf.gather_nd(logits, scores_to_gather)
-    log_probs += (sample_logits - log_prob_norm)
+    log_probs += (sample_logits - log_prob_norm) * tf.cast(tf.logical_not(finished), tf.float32)
     finished |= tf.equal(next_id, eos_id)
     decoded_ids = tf.concat([decoded_ids, tf.expand_dims(next_id, 2)], 2)
     return i + 1, finished, next_id, decoded_ids, log_probs, cache

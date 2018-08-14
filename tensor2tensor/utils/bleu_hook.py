@@ -85,6 +85,7 @@ def compute_bleu(reference_corpus,
   precisions = []
 
   for (references, translations) in zip(reference_corpus, translation_corpus):
+    tf.logging.info('REF {} HYP {}'.format(references, translations))
     reference_length += len(references)
     translation_length += len(translations)
     ref_ngram_counts = _get_ngrams(references, max_order)

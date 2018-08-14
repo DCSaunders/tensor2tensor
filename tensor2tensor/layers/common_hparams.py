@@ -221,11 +221,19 @@ def basic_params1():
       # NIST bleu smoothing for sentence-level ngram counts
       mrt_bleu_smooth=True,
       mrt_use_ref_score=True,
-      mrt_use_negative_loss=True,
+      # whether to use -bleu as bleu weighting
+      mrt_use_negative_bleu=False,
+      # whether to use 1-bleu as bleu weighting (0 bleu is good, 1 is bad)
+      mrt_zero_bleu_high=False,
+      # whether to weight all sample likelihoods by (estimated) sample-set bleu per sentence pair
+      mrt_use_set_bleu=False,
       mrt_subtract_av_bleu=False,
       # whether to add MRT loss (bleu-scaled sample xentropy) to normal NMT criteria (xentropy with reference)
       mrt_add_ref_xentropy=False,
+      mrt_sample_during_eval=False,
       log_all_training_losses=False,
+      log_sentence_pairs_seen=True,
+      log_sentences_step=100,
   )
 
 

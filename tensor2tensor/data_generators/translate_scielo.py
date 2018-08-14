@@ -54,7 +54,7 @@ class TranslateEsenScieloBioAndHealth(TranslateEndeWmt32k):
     vocab_filename = os.path.join(data_dir, self.vocab_file)
     return {"inputs": text_encoder.TokenTextEncoder(vocab_filename), 
             "targets": text_encoder.TokenTextEncoder(vocab_filename)}
-# End CF project
+
 
 
 @registry.register_problem
