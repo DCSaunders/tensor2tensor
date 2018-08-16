@@ -23,6 +23,7 @@ from __future__ import print_function
 import numpy as np
 
 from tensor2tensor.utils import yellowfin
+from tensor2tensor.utils import multistep_optimizer
 
 import tensorflow as tf
 
@@ -86,6 +87,13 @@ class ConditionalOptimizer(tf.train.Optimizer):
           beta1=hparams.optimizer_adam_beta1,
           beta2=hparams.optimizer_adam_beta2,
           epsilon=hparams.optimizer_adam_epsilon)
+    elif optimizer_name == "MultistepAdam":
+      self._opt = multistep_optimizer.MultistepAdamOptimizer(
+          lr,
+          beta1=hparams.optimizer_adam_beta1,
+          beta2=hparams.optimizer_adam_beta2,
+          epsilon=hparams.optimizer_adam_epsilon,
+          n=hparams.optimizer_multistep_accumulate_steps)
     elif optimizer_name == "Momentum":
       self._opt = tf.train.MomentumOptimizer(
           lr,
@@ -149,7 +157,7 @@ def learning_rate_decay(hparams, warmup_steps=0):
   """Learning rate decay multiplier."""
   scheme = hparams.learning_rate_decay_scheme
   warmup_steps = tf.to_float(warmup_steps)
-  global_step = tf.to_float(tf.train.get_or_create_global_step())
+  global_step = tf.to_float(_global_step(hparams))
 
   if not scheme or scheme == "none":
     return tf.constant(1.)
@@ -194,7 +202,7 @@ def learning_rate_decay(hparams, warmup_steps=0):
                    hparams.learning_rate_decay_scheme)
 
 
-def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
+def learning_rate_warmup(hparams, warmup_steps, warmup_schedule="exp"):
   """Learning rate warmup multiplier."""
   if not warmup_steps:
     return tf.constant(1.)
@@ -203,7 +211,7 @@ def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
                   warmup_schedule, warmup_steps)
 
   warmup_steps = tf.to_float(warmup_steps)
-  global_step = tf.to_float(tf.train.get_or_create_global_step())
+  global_step = tf.to_float(_global_step(hparams))
 
   if warmup_schedule == "exp":
     return tf.exp(tf.log(0.01) / warmup_steps)**(warmup_steps - global_step)
@@ -216,11 +224,11 @@ def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
 def learning_rate_decay_with_warmup(hparams, num_worker_replicas=1):
   """Learning rate decay rate with warmup based on hparams."""
   warmup_steps = hparams.learning_rate_warmup_steps * num_worker_replicas
-  warmup = learning_rate_warmup(warmup_steps)
+  warmup = learning_rate_warmup(hparams, warmup_steps)
 
   decay = learning_rate_decay(hparams, warmup_steps)
 
-  global_step = tf.train.get_or_create_global_step()
+  global_step = _global_step(hparams)
   return tf.where(global_step < warmup_steps, warmup, decay)
 
 
@@ -313,6 +321,17 @@ def log_variable_sizes(var_list=None, tag=None, verbose=False):
     total_size += v_size
   tf.logging.info("%s Total size: %d", tag, total_size)
 
+
+def _global_step(hparams):
+  """Adjust global step if a multi-step optimizer is used."""
+  step = tf.to_float(tf.train.get_or_create_global_step())
+  multiplier = hparams.optimizer_multistep_accumulate_steps
+  if multiplier <= 1:
+    return step
+
+  tf.logging.info("Dividing global step by %d for multi-step optimizer."
+                  % multiplier)
+  return step / tf.to_float(multiplier)
 
 def get_variable_initializer(hparams):
   """Get variable initializer from hparams."""
@@ -490,7 +509,7 @@ class AdafactorOptimizer(tf.train.Optimizer):
     grad_squared = tf.square(grad) + self._epsilon
     grad_squared_mean = tf.reduce_mean(grad_squared)
     lr = tf.to_float(self._lr)
-    global_step = tf.to_float(tf.train.get_or_create_global_step()) + 1.0
+    global_step = tf.to_float(_global_step(hparams)) + 1.0
     # HACK: Make lr and global_step dependent on grad.
     # This confounds the XLA rewriter and keeps it from fusing computations
     # across different variables.  This fusion is a bad for HBM usage, since
