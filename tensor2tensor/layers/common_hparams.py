@@ -232,6 +232,7 @@ def basic_params1():
       mrt_subtract_av_bleu=False,
       # whether to add MRT loss (bleu-scaled sample xentropy) to normal NMT criteria (xentropy with reference)
       mrt_add_ref_xentropy=False,
+      mrt_exclude_ref_from_mean_loss=False,
       mrt_sample_during_eval=False,
       log_all_training_losses=False,
       log_sentence_pairs_seen=True,

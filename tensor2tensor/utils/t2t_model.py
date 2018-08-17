@@ -464,48 +464,33 @@ class T2TModel(base.Layer):
     flat_samples = tf.expand_dims(tf.expand_dims(flat_samples, -1), -1)
     features['targets'] = flat_samples
     logits, losses = self.model_fn(features) # shape [batch_size * sample_num]
-
-
-    '''
-    # logits have shape [batch, p0, p1, ?, vocab_size]
-    target_shape = common_layers.shape_list(flat_samples)
-    batch_size = target_shape[0]
-    timesteps = target_shape[1]
-    reshaped_logits = tf.reshape(logits, [batch_size, timesteps, -1])
-    log_prob_norm = tf.reduce_logsumexp(reshaped_logits, axis=2)
-    ids = tf.reshape(flat_samples, [batch_size, -1, 1])
-    batch_ids = tf.expand_dims(beam_search.compute_batch_indices(batch_size, timesteps), -1)
-    pos_ids = tf.reshape(tf.tile(tf.expand_dims(tf.range(timesteps), -1), [batch_size, 1]), 
-                          [batch_size, -1, 1])
-    gather_ids = tf.concat([batch_ids, pos_ids, ids], axis=2)
-    sentence_tok_log_probs = tf.gather_nd(reshaped_logits, gather_ids) - log_prob_norm # shape: [batch_size, timesteps]
-    losses['training'] = (sentence_tok_log_probs * weights, 1.0)
-    '''
-
-
     losses['training'] = (tf.squeeze(tf.reduce_sum(losses['training'][0], axis=1)),
                           tf.reduce_sum(losses['training'][1]))
 
     if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
-      losses = self.adjust_mrt_loss(losses, bleus, sample_count)
-    if self.hparams.mrt_add_ref_xentropy:
-      orig_loss = orig_losses['training']
-      new_loss = losses['training']
-      losses['training'] = orig_loss
-      losses['mrt'] = new_loss
+      losses = self.adjust_mrt_loss(losses, orig_losses['training'], bleus, sample_count)
     return logits, losses
 
 
-  def adjust_mrt_loss(self, losses, bleus, sample_count):
+  def adjust_mrt_loss(self, losses, ref_losses, bleus, sample_count):
     loss_num, loss_den = losses['training']
     loss_den = tf.reduce_sum(loss_den)
     loss_shape = common_layers.shape_list(loss_num)
     bleus = tf.reshape(bleus, loss_shape)
-    if self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
-      loss_num *= bleus * self.hparams.mrt_alpha
-      loss_den *= (sample_count - 1)
-      loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
+    loss_num *= bleus
+    loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
+    if self.hparams.mrt_exclude_ref_from_mean_loss:
+      # we don't do a second forward pass of the reference, but want to include its loss here
+      loss_num += tf.reduce_sum(ref_losses[0])
+      loss_den += tf.reduce_sum(ref_losses[1])
+    loss_num *= self.hparams.mrt_alpha
+    loss_den *= (sample_count - 1)
     losses['training'] = (loss_num, loss_den)
+    if self.hparams.mrt_add_ref_xentropy:
+      new_loss = losses['training']
+      losses['training'] = ref_losses
+      losses['mrt'] = new_loss
+
     return losses
 
 
