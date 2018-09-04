@@ -74,7 +74,6 @@ def optimize(loss, learning_rate, hparams, use_tpu=False):
       optimizer=opt,
       summaries=opt_summaries,
       colocate_gradients_with_ops=True)
-
   return train_op
 
 

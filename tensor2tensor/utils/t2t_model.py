@@ -40,7 +40,6 @@ from tensor2tensor.utils import optimize
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
-from tensorflow.python.training import training
 from tensorflow.python.eager import context
 from tensorflow.python.layers import base
 from tensorflow.python.ops import variable_scope
