@@ -93,7 +93,6 @@ class EWCOptimizer(ConditionalOptimizer):
     self.model_dir = hparams.model_dir
     self.lag_vals = []
     self.fisher_vals = []
-    self.first = True
 
     self.final_step = hparams.train_steps
     self.save_ewc_step = 0
@@ -125,10 +124,10 @@ class EWCOptimizer(ConditionalOptimizer):
     if self.first_save_ewc_step < 0:
       self.first_save_ewc_step = global_step
     last_step = (global_step >= self.first_save_ewc_step + self.fisher_accum_steps - 1)
-    tf.logging.info('Updating EWC vars: step {}'.format(global_step))
+    #tf.logging.debug('Updating EWC vars: step {}'.format(global_step))
     for idx, grad_var_pair in enumerate(grads_vars_and_step[:-1]):
       fisher_val = grad_var_pair[0] / self.fisher_accum_steps
-      if idx <= len(self.fisher_vals):
+      if idx == len(self.fisher_vals):
         self.fisher_vals.append(fisher_val)
       else:
         self.fisher_vals[idx] += fisher_val
@@ -150,10 +149,8 @@ class EWCOptimizer(ConditionalOptimizer):
     
 
   def apply_gradients(self, grads_and_vars, global_step=None, name=None):
-    if self.first:
-      self.first = False
-      v_list = [v for (_, v) in grads_and_vars]
-      self._opt._create_slots(v_list)
+    v_list = [v for (_, v) in grads_and_vars]
+    self._opt._create_slots(v_list)
     fisher_cond = tf.logical_and(tf.constant(self.save_vars, dtype=tf.bool),
                                  tf.greater_equal(global_step, self.save_ewc_step))
     maybe_accumulate_fisher = tf.cond(fisher_cond,
