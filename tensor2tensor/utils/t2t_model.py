@@ -416,7 +416,11 @@ class T2TModel(base.Layer):
     samples = results["outputs"]
     orig_targets = tf.squeeze(orig_features['targets'], [2, 3])
     sample_count, samples = self._maybe_add_ref(samples, orig_targets)
-    bleus = tf.py_func(self._get_sentence_bleu, [samples, orig_targets], tf.float32)
+    if self.hparams.mrt_use_set_bleu:
+      tf.logging.info('Using sample set bleus')
+      bleus = tf.py_func(self._get_sample_set_bleu, [samples, orig_targets], tf.float32)
+    else:
+      bleus = tf.py_func(self._get_sentence_bleu, [samples, orig_targets], tf.float32)
     logits, losses =  self._forward_pass_samples(orig_features, samples, bleus, sample_count, orig_losses)
     #losses['tmp'] = self.do_hacky_print(results["scores"])
     return logits, losses
@@ -532,6 +536,46 @@ class T2TModel(base.Layer):
       #tf.logging.info(sentence_bleus[-1])
     return np.asarray(sentence_bleus, dtype=np.float32)
 
+ def _get_sample_set_bleu(self, samples, targets, max_order=4):
+    sample_count = len(samples[0])
+    set_matches = {idx: max_order * [0.0] for idx in range(sample_count)}
+    set_hyps = {idx: max_order * [0.0] for idx in range(sample_count)}
+    set_lens = {idx: 0 for idx in range(sample_count)}
+    set_bleus = []
+    len_ref = 0
+    for idx, sample_batch in enumerate(samples):
+      ref = decoding._save_until_eos(targets[idx], is_image=False)
+      len_ref += len(ref)
+      for sample_idx, sample in enumerate(sample_batch):
+        hyp = decoding._save_until_eos(sample, is_image=False)
+        set_lens[sample_idx] += len(hyp)
+        self._get_ngram_matches(hyp, ref, set_matches[sample_idx], set_hyps[sample_idx], max_order)
+    for set_idx in range(sample_count):
+      smooth = 1.0
+      precisions = max_order * [0]
+      for i in xrange(max_order):
+        if set_hyps[set_idx][i]:
+          if set_matches[set_idx][i]:
+            precisions[i] = set_matches[set_idx][i] / set_hyps[set_idx][i]
+          elif self.hparams.mrt_bleu_smooth:
+            smooth *= 2
+            precisions[i] = 1.0 / (smooth * set_hyps[set_idx][i])
+      bleu = math.exp(sum(math.log(p) for p in precisions if p) / max_order)
+      if self.hparams.mrt_use_bleu_bp and len_ref:
+        ratio = max(set_lens[set_idx], 1) / len_ref)
+        if ratio < 1.0:
+          bleu *= math.exp(1 - 1. / ratio)
+      set_bleus.append(bleu)
+    set_bleus = np.asarray(set_bleus)
+    if self.hparams.mrt_subtract_av_bleu:
+      set_bleus -= np.mean(set_bleus)
+    overall_bleus = []
+    for _ in range(len(samples)):
+      overall_bleus.append(set_bleus)
+    return np.asarray(overall_bleus, dtype=np.float32)
+
+    
+  
     
   def _get_ngram_matches(self, hyp, ref, matches_by_order, hyp_ngrams_by_order, max_order):
     hyp_ngrams = bleu_hook._get_ngrams(hyp, max_order)

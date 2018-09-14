@@ -237,6 +237,8 @@ def basic_params1():
       log_all_training_losses=False,
       log_sentence_pairs_seen=True,
       log_sentences_step=100,
+      # Set this for accumulating gradients over multiple batches
+      fake_gpu_multiplier=1,
   )
 
 
@@ -378,4 +380,4 @@ def basic_range1(ranged_hparams):
   rhp.set_float("optimizer_adam_beta2", 0.995, 0.999)
   rhp.set_categorical(
       "optimizer",
-      ["Adam", "Adagrad", "Momentum", "RMSProp", "SGD", "YellowFin"])
+      ["Adam", "LargebatchAdam", "Adagrad", "Momentum", "RMSProp", "SGD", "YellowFin"])
