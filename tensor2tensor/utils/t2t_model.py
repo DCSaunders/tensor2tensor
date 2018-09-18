@@ -422,7 +422,7 @@ class T2TModel(base.Layer):
     else:
       bleus = tf.py_func(self._get_sentence_bleu, [samples, orig_targets], tf.float32)
     logits, losses =  self._forward_pass_samples(orig_features, samples, bleus, sample_count, orig_losses)
-    #losses['tmp'] = self.do_hacky_print(results["scores"])
+    #losses['tmp'] = self.do_hacky_print(results["outputs"])
     return logits, losses
   
   def _trim_eos_samples(self, samples):
@@ -536,7 +536,7 @@ class T2TModel(base.Layer):
       #tf.logging.info(sentence_bleus[-1])
     return np.asarray(sentence_bleus, dtype=np.float32)
 
- def _get_sample_set_bleu(self, samples, targets, max_order=4):
+  def _get_sample_set_bleu(self, samples, targets, max_order=4):
     sample_count = len(samples[0])
     set_matches = {idx: max_order * [0.0] for idx in range(sample_count)}
     set_hyps = {idx: max_order * [0.0] for idx in range(sample_count)}
@@ -550,6 +550,9 @@ class T2TModel(base.Layer):
         hyp = decoding._save_until_eos(sample, is_image=False)
         set_lens[sample_idx] += len(hyp)
         self._get_ngram_matches(hyp, ref, set_matches[sample_idx], set_hyps[sample_idx], max_order)
+      #tf.logging.info('Set lengths: {}'.format(set_lens))
+      #tf.logging.info('Set matches: {}'.format(set_matches))
+      #tf.logging.info('Set hyps: {}'.format(set_hyps))
     for set_idx in range(sample_count):
       smooth = 1.0
       precisions = max_order * [0]
@@ -562,16 +565,18 @@ class T2TModel(base.Layer):
             precisions[i] = 1.0 / (smooth * set_hyps[set_idx][i])
       bleu = math.exp(sum(math.log(p) for p in precisions if p) / max_order)
       if self.hparams.mrt_use_bleu_bp and len_ref:
-        ratio = max(set_lens[set_idx], 1) / len_ref)
+        ratio = max(set_lens[set_idx], 1) / len_ref
         if ratio < 1.0:
           bleu *= math.exp(1 - 1. / ratio)
       set_bleus.append(bleu)
+    #tf.logging.info('Set bleus (no mean reduction) {}'.format(set_bleus))
     set_bleus = np.asarray(set_bleus)
     if self.hparams.mrt_subtract_av_bleu:
       set_bleus -= np.mean(set_bleus)
     overall_bleus = []
     for _ in range(len(samples)):
       overall_bleus.append(set_bleus)
+    #tf.logging.info('Set bleus (tiled, mean reduction) {}'.format(overall_bleus))
     return np.asarray(overall_bleus, dtype=np.float32)
 
     

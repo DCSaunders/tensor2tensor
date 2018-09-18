@@ -617,9 +617,11 @@ def fast_sample(cache,
     back_prop=False)
   pad_len = decode_length - common_layers.shape_list(decoded_ids)[2]
   padded_decoded_ids = tf.pad(decoded_ids, [[0, 0], [0, 0], [0, pad_len]])
-  scores = None
-  return {"outputs": padded_decoded_ids, "scores": log_probs}
 
+  sorted_probs, sorted_indices = tf.nn.top_k(log_probs, k=sample_num, sorted=False)
+  to_gather = tf.stack([batch_pos, sorted_indices], axis=2)
+  sorted_decoded_ids = tf.gather_nd(padded_decoded_ids, to_gather)
+  return {"outputs": sorted_decoded_ids, "scores": sorted_probs}
 
 
 @registry.register_model
