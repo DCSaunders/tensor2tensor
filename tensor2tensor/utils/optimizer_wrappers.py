@@ -126,7 +126,7 @@ class EWCOptimizer(ConditionalOptimizer):
     last_step = (global_step >= self.first_save_ewc_step + self.fisher_accum_steps - 1)
     #tf.logging.debug('Updating EWC vars: step {}'.format(global_step))
     for idx, grad_var_pair in enumerate(grads_vars_and_step[:-1]):
-      fisher_val = grad_var_pair[0] / self.fisher_accum_steps
+      fisher_val = np.square(grad_var_pair[0]) / self.fisher_accum_steps
       if idx == len(self.fisher_vals):
         self.fisher_vals.append(fisher_val)
       else:
@@ -159,10 +159,13 @@ class EWCOptimizer(ConditionalOptimizer):
       name=name)
     return maybe_accumulate_fisher
 
+  def hacky_print(self, t):
+    tf.logging.info(t)
+    return np.float32(0.0)
 
   def get_ewc_loss(self):
     tf.logging.info('Adding EWC penalty to loss with lambda {}'.format(self.ewc_loss_weight))
-    penalty = tf.add_n([tf.reduce_sum(tf.square(l - t) * f)
-      for l, t, f in zip(self.lag_vals, tf.trainable_variables(), self.fisher_vals)])
-    ewc_loss = self.ewc_loss_weight * penalty
+    ewc_losses = [tf.reduce_sum(tf.square(l - t) * f)
+                  for l, t, f in zip(self.lag_vals, tf.trainable_variables(), self.fisher_vals)]
+    ewc_loss = self.ewc_loss_weight * tf.add_n(ewc_losses) 
     return ewc_loss
