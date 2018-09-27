@@ -224,6 +224,7 @@ def basic_params1():
       ewc_checkpoint='ewc_vars',
       #number of minibatches to use when recomputing Fisher diagonal for EWC
       ewc_fisher_accum_steps=200,
+      ewc_ignore_fisher=False,
       log_all_training_losses=False,
   )
 

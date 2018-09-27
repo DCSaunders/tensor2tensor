@@ -88,6 +88,7 @@ class EWCOptimizer(ConditionalOptimizer):
   def __init__(self, optimizer_name, lr, hparams, use_tpu=False):
     super(EWCOptimizer, self).__init__(optimizer_name, lr, hparams, use_tpu)
     self.load_vars = hparams.ewc_load_vars
+    self.ignore_fisher = hparams.ewc_ignore_fisher
     self.save_vars = hparams.ewc_save_vars
     self.ewc_loss_weight = hparams.ewc_loss_weight
     self.model_dir = hparams.model_dir
@@ -165,7 +166,11 @@ class EWCOptimizer(ConditionalOptimizer):
 
   def get_ewc_loss(self):
     tf.logging.info('Adding EWC penalty to loss with lambda {}'.format(self.ewc_loss_weight))
-    ewc_losses = [tf.reduce_sum(tf.square(l - t) * f)
-                  for l, t, f in zip(self.lag_vals, tf.trainable_variables(), self.fisher_vals)]
+    if self.ignore_fisher:
+      ewc_losses = [tf.reduce_sum(tf.square(l - t))
+                    for l, t in zip(self.lag_vals, tf.trainable_variables())]
+    else:
+      ewc_losses = [tf.reduce_sum(tf.square(l - t) * f)
+                    for l, t, f in zip(self.lag_vals, tf.trainable_variables(), self.fisher_vals)]
     ewc_loss = self.ewc_loss_weight * tf.add_n(ewc_losses) 
     return ewc_loss
