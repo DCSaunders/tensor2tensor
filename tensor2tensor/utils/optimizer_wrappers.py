@@ -123,9 +123,9 @@ class EWCOptimizer(ConditionalOptimizer):
   def update_ewc_vals(self, *grads_vars_and_step):
     global_step = grads_vars_and_step[-1]
     if self.first_save_ewc_step < 0:
-      self.first_save_ewc_step = global_step
+      self.first_save_ewc_step = self.save_ewc_step
     last_step = (global_step >= self.first_save_ewc_step + self.fisher_accum_steps - 1)
-    #tf.logging.debug('Updating EWC vars: step {}'.format(global_step))
+    tf.logging.debug('Updating EWC vars: step {}'.format(global_step))
     for idx, grad_var_pair in enumerate(grads_vars_and_step[:-1]):
       fisher_val = np.square(grad_var_pair[0]) / self.fisher_accum_steps
       if idx == len(self.fisher_vals):
