@@ -166,6 +166,8 @@ class EWCOptimizer(ConditionalOptimizer):
 
   def get_ewc_loss(self):
     tf.logging.info('Adding EWC penalty to loss with lambda {}'.format(self.ewc_loss_weight))
+    #for t in tf.trainable_variables():
+    #  tf.logging.info(t.name)
     if self.ignore_fisher:
       ewc_losses = [tf.reduce_sum(tf.square(l - t))
                     for l, t in zip(self.lag_vals, tf.trainable_variables())]
