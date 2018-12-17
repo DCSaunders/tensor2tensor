@@ -162,6 +162,21 @@ class SymbolModality(modality.Modality):
               logits, body_output_shape[:-1] + [1, self._vocab_size])
 
 
+@registry.register_symbol_modality("sequence")
+class SequenceSymbolModality(SymbolModality):
+  """SymbolModality that leaves loss unsummed for each sequence in batch."""
+
+  def loss(self, logits, targets):
+    xent, weights = common_layers.padded_cross_entropy(
+        logits,
+        targets,
+        self._model_hparams.label_smoothing,
+        weights_fn=self.targets_weights_fn,
+        reduce_sum=False)
+    return xent, tf.reduce_sum(weights)
+
+
+
 @registry.register_symbol_modality("ctc")
 class CTCSymbolModality(SymbolModality):
   """SymbolModality that uses CTC loss."""

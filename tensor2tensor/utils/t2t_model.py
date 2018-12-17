@@ -40,6 +40,7 @@ from tensor2tensor.utils import optimize
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
+import numpy as np
 from tensorflow.python.eager import context
 from tensorflow.python.layers import base
 from tensorflow.python.ops import variable_scope
@@ -91,8 +92,12 @@ class T2TModel(base.Layer):
     super(T2TModel, self).__init__(
         trainable=mode == tf.estimator.ModeKeys.TRAIN, name=name)
 
-    if not problem_hparams and hasattr(hparams, "problems"):
-      problem_hparams = hparams.problems[0]
+    #if not problem_hparams and 
+    if problem_hparams is None:
+      if hasattr(hparams, "problem"):
+        problem_hparams = hparams.problem.get_hparams()
+      elif hasattr(hparams, "problems"):
+        problem_hparams = hparams.problems[0]
     self._problem_hparams = problem_hparams
 
     # Setup hparams
@@ -291,6 +296,12 @@ class T2TModel(base.Layer):
       
     target_modality = self._problem_hparams.target_modality
     loss_num, loss_den = target_modality.loss(logits, features["targets"])
+    if len(common_layers.shape_list(loss_num)) != 0:
+      if 'sequence_scale' in features:
+        loss_num = tf.reduce_sum(loss_num, axis=[-3, -2, -1])
+        loss_num *= tf.reshape(features['sequence_scale'],
+                               common_layers.shape_list(loss_num))
+      loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
     loss_num *= self._problem_hparams.loss_multiplier
     return loss_num, loss_den
 
@@ -565,6 +576,13 @@ class T2TModel(base.Layer):
       }
     """
     return self._slow_greedy_infer(features, decode_length)
+
+
+  
+  def hacky_print(self, t):
+    tf.logging.info(t)
+    return np.float32(0.0)
+
 
   def _slow_greedy_infer(self, features, decode_length):
     """A slow greedy inference method.

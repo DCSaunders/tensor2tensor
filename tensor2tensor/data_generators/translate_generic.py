@@ -35,6 +35,8 @@ _VOCABS = ("vocab/vocab.src",
            "vocab/vocab.trg",
            "vocab/vocab.shared")
 
+_SCALE = ("train/scale")
+
 def _compile_data(tmp_dir, datasets, filename):
   """Concatenate all `datasets` and save to `filename`."""
   filename = os.path.join(tmp_dir, filename)
@@ -210,3 +212,105 @@ class TranslateGenericExistingSharedVocab(translate.TranslateProblem):
     data_path = _compile_data(tmp_dir, datasets, "generic_tok_%s" % tag)
     return translate.token_generator(data_path + ".src", data_path + ".trg",
                                      token_vocab, EOS)
+
+
+@registry.register_problem
+class TranslateGenericExistingVocabSentenceScale(TranslateGenericExistingVocab):
+  """Problem spec for generic translation, using existing vocab, with a scaling factor for each sequence"""
+  
+  def example_reading_spec(self):
+    data_fields = {
+        "inputs": tf.VarLenFeature(tf.int64),
+        "targets": tf.VarLenFeature(tf.int64),
+        "sequence_scale": tf.VarLenFeature(tf.float32),
+
+    }
+    return data_fields, None    
+
+
+  def hparams(self, defaults, model_hparams):
+    super(TranslateGenericExistingVocabSentenceScale, self).hparams(defaults, model_hparams)
+    target_vocab_size = self._encoders["targets"].vocab_size
+    defaults.target_modality = ("{}:sequence".format(registry.Modalities.SYMBOL), target_vocab_size)
+    defaults.input_modality['inputs'] = ("{}:sequence".format(registry.Modalities.SYMBOL), target_vocab_size)
+
+
+  def generator(self, data_dir, tmp_dir, train):
+    datasets = _TRAIN_DATASETS if train else _TEST_DATASETS
+    source_datasets = [[FLAGS.raw_data_dir, [item[0]]] for item in datasets]
+    target_datasets = [[FLAGS.raw_data_dir, [item[1]]] for item in datasets]
+    # Copy vocab to data directory
+    source_vocab_path = os.path.join(data_dir, self.source_vocab_name)
+    target_vocab_path = os.path.join(data_dir, self.target_vocab_name)
+    if os.path.exists(source_vocab_path):
+        os.remove(source_vocab_path)
+    if os.path.exists(target_vocab_path):
+        os.remove(target_vocab_path)
+
+    copyVocab(os.path.join(FLAGS.raw_data_dir, _VOCABS[0]), source_vocab_path)
+    copyVocab(os.path.join(FLAGS.raw_data_dir, _VOCABS[1]), target_vocab_path)
+  
+    source_token_vocab = text_encoder.TokenTextEncoder(source_vocab_path, replace_oov="<unk>")
+    target_token_vocab = text_encoder.TokenTextEncoder(target_vocab_path, replace_oov="<unk>")
+    tag = "train" if train else "dev"
+    data_path = _compile_data(tmp_dir, datasets, "generic_tok_%s" % tag)
+    generator_args = ["{}.src".format(data_path),
+                      "{}.trg".format(data_path),
+                      source_token_vocab,
+                      target_token_vocab,
+                      EOS]
+    scale_path = None
+    if train:
+      scale_path = os.path.join(FLAGS.raw_data_dir, _SCALE)
+    generator_args.append(scale_path)
+    return bi_vocabs_with_scaling_token_generator(*generator_args)
+
+
+def bi_vocabs_with_scaling_token_generator(source_path,
+                                           target_path,
+                                           source_token_vocab,
+                                           target_token_vocab,
+                                           eos,
+                                           scale_path):
+  """Generator for sequence-to-sequence tasks that uses tokens.
+  This generator assumes the files at source_path and target_path have
+  the same number of lines and yields dictionaries of "inputs" and "targets"
+  where inputs are token ids from the " "-split source (and target, resp.) lines
+  converted to integers using the token_map.
+  Args:
+    source_path: path to the file with source sentences.
+    target_path: path to the file with target sentences.
+    source_token_vocab: text_encoder.TextEncoder object.
+    target_token_vocab: text_encoder.TextEncoder object.
+    eos: integer to append at the end of each sequence (default: None).
+    scale_path: path to file with scaling factors for sentence pairs.
+  Yields:
+    A dictionary {"inputs": source-line, "targets": target-line, "scale": scaling-factor} where
+    the lines are integer lists converted from tokens in the file lines.
+  """
+  eos_list = [eos]
+  if scale_path:
+    with tf.gfile.GFile(source_path, mode="r") as source_file:
+      with tf.gfile.GFile(target_path, mode="r") as target_file:
+        with tf.gfile.GFile(scale_path, mode="r") as scale_file:
+          source, target, scale = source_file.readline(), target_file.readline(), scale_file.readline()
+          while source and target and scale:
+            source_ints = source_token_vocab.encode(source.strip()) + eos_list
+            target_ints = target_token_vocab.encode(target.strip()) + eos_list
+            scale_float = float(scale.strip())
+            yield {"inputs": source_ints, "targets": target_ints, "sequence_scale": [scale_float]}
+            source, target, scale = source_file.readline(), target_file.readline(), scale_file.readline()
+  else:
+    with tf.gfile.GFile(source_path, mode="r") as source_file:
+      with tf.gfile.GFile(target_path, mode="r") as target_file:
+          source, target = source_file.readline(), target_file.readline()
+          while source and target:
+            source_ints = source_token_vocab.encode(source.strip()) + eos_list
+            target_ints = target_token_vocab.encode(target.strip()) + eos_list
+            yield {"inputs": source_ints,
+                   "targets": target_ints,
+                   "sequence_scale": [1.0]}
+            source, target = source_file.readline(), target_file.readline()
+
+
+
