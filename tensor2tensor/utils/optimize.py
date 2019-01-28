@@ -23,6 +23,7 @@ from __future__ import print_function
 import numpy as np
 
 from tensor2tensor.utils import yellowfin
+from tensor2tensor.utils import largebatch_optimizer
 
 import tensorflow as tf
 
@@ -77,6 +78,59 @@ def optimize(loss, learning_rate, hparams, use_tpu=False):
   return train_op
 
 
+class ConditionalOptimizer(tf.train.Optimizer):
+  """Conditional optimizer."""
+
+  def __init__(self, optimizer_name, lr, hparams, use_tpu=False):
+    if optimizer_name == "Adam" and use_tpu:
+      # LazyAdamOptimizer does not work on TPU
+      optimizer_name = "TrueAdam"
+
+    tf.logging.info("Using optimizer %s", optimizer_name)
+
+    if optimizer_name == "Adam":
+      # We change the default epsilon for Adam and re-scale lr.
+      # Using LazyAdam as it's much faster for large vocabulary embeddings.
+      self._opt = tf.contrib.opt.LazyAdamOptimizer(
+          lr / 500.0,
+          beta1=hparams.optimizer_adam_beta1,
+          beta2=hparams.optimizer_adam_beta2,
+          epsilon=hparams.optimizer_adam_epsilon)
+    elif optimizer_name == "LargebatchAdam":
+      self._opt = largebatch_optimizer.LargebatchAdamOptimizer(
+          lr / 500.0,
+          beta1=hparams.optimizer_adam_beta1,
+          beta2=hparams.optimizer_adam_beta2,
+          epsilon=hparams.optimizer_adam_epsilon,
+          n=hparams.largebatch_multiplier)
+    elif optimizer_name == "Momentum":
+      self._opt = tf.train.MomentumOptimizer(
+          lr,
+          momentum=hparams.optimizer_momentum_momentum,
+          use_nesterov=hparams.optimizer_momentum_nesterov)
+    elif optimizer_name == "YellowFin":
+      self._opt = yellowfin.YellowFinOptimizer(
+          learning_rate=lr, momentum=hparams.optimizer_momentum_momentum)
+    elif optimizer_name == "TrueAdam":
+      self._opt = tf.train.AdamOptimizer(
+          lr / 500.0,
+          beta1=hparams.optimizer_adam_beta1,
+          beta2=hparams.optimizer_adam_beta2,
+          epsilon=hparams.optimizer_adam_epsilon)
+    elif optimizer_name == "Adafactor":
+      self._opt = AdafactorOptimizer(lr / 500.0)
+    else:
+      self._opt = tf.contrib.layers.OPTIMIZER_CLS_NAMES[optimizer_name](lr)
+
+  def compute_gradients(self, loss, var_list=None, **kwargs):
+    return self._opt.compute_gradients(loss, var_list, **kwargs)
+
+  def apply_gradients(self, grads_and_vars, global_step=None, name=None):
+    return self._opt.apply_gradients(
+        grads_and_vars, global_step=global_step, name=name)
+
+
+>>>>>>> dsaunders_v1.4.3_modified-accumulate_gradients
 def _sqrt_decay(step):
   """Decay like 1 / sqrt(step), multiplied by 500 to normalize."""
   return 500.0 / tf.sqrt(tf.maximum(step, 1.0))
@@ -108,12 +162,26 @@ def piecewise_learning_rate(step, boundaries, values):
   return tf.train.piecewise_constant(
       step, boundaries, values, name="piecewise_lr")
 
-
-def learning_rate_decay(hparams, warmup_steps=0):
-  """Learning rate decay multiplier."""
-  scheme = hparams.learning_rate_decay_scheme
-  warmup_steps = tf.to_float(warmup_steps)
+def get_global_step(hparams):
   global_step = tf.to_float(tf.train.get_or_create_global_step())
+  if hparams is not None:
+    try:
+      if hparams.largebatch_multiplier > 1:
+        tf.logging.info("Scaling down global step for optimizer by "
+                        "largebatch_multiplier=%d" % hparams.largebatch_multiplier)
+        largebatch_multiplier = tf.constant(hparams.largebatch_multiplier,
+                                          dtype=tf.float32)
+        global_step = global_step / largebatch_multiplier
+    except AttributeError:
+      pass
+  return global_step
+
+
+def learning_rate_decay(hparams, warmup_steps=0, num_worker_replicas=1, num_train_steps=1):
+  """Inverse-decay learning rate until warmup_steps, then decay."""
+  scheme = hparams.learning_rate_decay_scheme
+  warmup_steps = tf.to_float(warmup_steps * num_worker_replicas)
+  global_step = get_global_step(hparams)
 
   if not scheme or scheme == "none":
     return tf.constant(1.)
@@ -131,7 +199,7 @@ def learning_rate_decay(hparams, warmup_steps=0):
     return piecewise_learning_rate(global_step,
                                    hparams.learning_rate_boundaries,
                                    hparams.learning_rate_multiples)
-
+    
   if scheme == "noam":
     return 5000.0 * hparams.hidden_size**-0.5 * tf.minimum(
         (global_step + 1) * warmup_steps**-1.5, (global_step + 1)**-0.5)
@@ -158,7 +226,7 @@ def learning_rate_decay(hparams, warmup_steps=0):
                    hparams.learning_rate_decay_scheme)
 
 
-def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
+def learning_rate_warmup(warmup_steps, warmup_schedule="exp", hparams=None):
   """Learning rate warmup multiplier."""
   if not warmup_steps:
     return tf.constant(1.)
@@ -167,7 +235,7 @@ def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
                   warmup_schedule, warmup_steps)
 
   warmup_steps = tf.to_float(warmup_steps)
-  global_step = tf.to_float(tf.train.get_or_create_global_step())
+  global_step = get_global_step(hparams)
 
   if warmup_schedule == "exp":
     return tf.exp(tf.log(0.01) / warmup_steps)**(warmup_steps - global_step)
@@ -180,11 +248,10 @@ def learning_rate_warmup(warmup_steps, warmup_schedule="exp"):
 def learning_rate_decay_with_warmup(hparams, num_worker_replicas=1):
   """Learning rate decay rate with warmup based on hparams."""
   warmup_steps = hparams.learning_rate_warmup_steps * num_worker_replicas
-  warmup = learning_rate_warmup(warmup_steps)
-
+  warmup = learning_rate_warmup(warmup_steps, hparams=hparams)
+  
   decay = learning_rate_decay(hparams, warmup_steps)
-
-  global_step = tf.train.get_or_create_global_step()
+  global_step = get_global_step(hparams)
   return tf.where(global_step < warmup_steps, warmup, decay)
 
 

@@ -237,6 +237,8 @@ def basic_params1():
       mrt_bleu_max_order=4,
       mrt_use_brevity_penalty=True,
       mrt_gold_mixin_prob=0.0,
+      # Set this for accumulating gradients over multiple batches
+      largebatch_multiplier=1,
   )
 
 
@@ -378,4 +380,4 @@ def basic_range1(ranged_hparams):
   rhp.set_float("optimizer_adam_beta2", 0.995, 0.999)
   rhp.set_categorical(
       "optimizer",
-      ["Adam", "Adagrad", "Momentum", "RMSProp", "SGD", "YellowFin"])
+      ["Adam", "LargebatchAdam", "Adagrad", "Momentum", "RMSProp", "SGD", "YellowFin"])
