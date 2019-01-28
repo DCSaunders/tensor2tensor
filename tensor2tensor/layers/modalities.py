@@ -140,7 +140,6 @@ class SymbolModality(modality.Modality):
     else:
       scope_name = "softmax"
       reuse = False
-
     with tf.variable_scope(scope_name, reuse=reuse):
       body_output_shape = common_layers.shape_list(body_output)
       var = self._get_weights(body_output_shape[-1])

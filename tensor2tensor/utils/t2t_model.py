@@ -181,7 +181,7 @@ class T2TModel(base.Layer):
     # TODO(rsepassi): Reenable scheduled sampling
     # Disabled because of model_fn_sharded refactor
     #
-    # do_scheduled_sampling = (  # Only do it if training and set for it.
+    #do_scheduled_sampling = (  # Only do it if training and set for it.
     #     self.hparams.scheduled_sampling_prob > 0.0 and
     #     self.hparams.mode == tf.estimator.ModeKeys.TRAIN)
     # if do_scheduled_sampling:
@@ -194,12 +194,10 @@ class T2TModel(base.Layer):
 
   def model_fn(self, features):
     transformed_features = self.bottom(features)
-
     with tf.variable_scope("body"):
       tf.logging.info("Building model body")
       body_out = self.body(transformed_features)
     output, losses = self._normalize_body_output(body_out)
-
     if "training" in losses:
       tf.logging.info("Skipping T2TModel top and loss because training loss "
                       "returned from body")
@@ -269,7 +267,7 @@ class T2TModel(base.Layer):
       return body_output
 
     target_modality = self._problem_hparams.target_modality
-    with tf.variable_scope(target_modality.name):
+    with tf.variable_scope(target_modality.name, reuse=tf.AUTO_REUSE):
       tf.logging.info("Transforming body output with %s.top",
                       target_modality.name)
       last_only = (
@@ -299,9 +297,12 @@ class T2TModel(base.Layer):
     if len(common_layers.shape_list(loss_num)) != 0:
       if 'sequence_scale' in features:
         loss_num = tf.reduce_sum(loss_num, axis=[-3, -2, -1])
+        #loss_den += do_hacky_print(loss_num)
+        #loss_den += do_hacky_print(features['sequence_scale'])
         loss_num *= tf.reshape(features['sequence_scale'],
                                common_layers.shape_list(loss_num))
       loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
+
     loss_num *= self._problem_hparams.loss_multiplier
     return loss_num, loss_den
 
@@ -1188,3 +1189,11 @@ def summarize_features(features, num_shards=1):
                           tf.reduce_mean(nonpadding))
 
 
+
+def hacky_print(t):
+  tf.logging.info(t)
+  return np.float32(0.0)
+
+def do_hacky_print(tensor_to_log):
+  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
+  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())

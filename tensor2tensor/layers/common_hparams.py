@@ -215,17 +215,28 @@ def basic_params1():
       no_data_parallelism=False,
       # if ewc_load_vars is true, must have saved ewc vars in the loaded checkpoint
       ewc_load_vars=False,
-      ewc_loss_weight=0.5,
+      # a weight or semicolon-separated list of weights
+      ewc_loss_weight="1000", # cast to float before use
       # location to save task vars during elastic weight consolidation
       ewc_save_vars=False,
-      # name to group vars under EWC
-      ewc_lagged_collect='EWC',
-      ewc_fisher_collect='FISHER',
+      ewc_checkpoint_to_save='ewc_vars',
+      # file (or semicolon-separated files) containing pickled ewc vars   
       ewc_checkpoint='ewc_vars',
       #number of minibatches to use when recomputing Fisher diagonal for EWC
       ewc_fisher_accum_steps=200,
       ewc_ignore_fisher=False,
       log_all_training_losses=False,
+      greedy_sample_count=1, #number of random samples per sentence
+      mrt_include_gold=False,
+      mrt_include_gold_in_av=False,
+      mrt_use_batch_bleu=False,
+      mrt_order_by_matches=False,
+      mrt_subtract_av_metric=False,
+      mrt_use_negative_bleu=False,
+      mrt_zero_bleu_high=False,
+      mrt_bleu_max_order=4,
+      mrt_use_brevity_penalty=True,
+      mrt_gold_mixin_prob=0.0,
   )
 
 

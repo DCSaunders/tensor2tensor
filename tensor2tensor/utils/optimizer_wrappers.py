@@ -90,54 +90,72 @@ class EWCOptimizer(ConditionalOptimizer):
     self.load_vars = hparams.ewc_load_vars
     self.ignore_fisher = hparams.ewc_ignore_fisher
     self.save_vars = hparams.ewc_save_vars
-    self.ewc_loss_weight = hparams.ewc_loss_weight
     self.model_dir = hparams.model_dir
+    self.get_checkpoints_and_weights(hparams)
+    self.lag_vals_to_save = []
+    self.fisher_vals_to_save = []
     self.lag_vals = []
     self.fisher_vals = []
 
     self.final_step = hparams.train_steps
-    self.save_ewc_step = 0
+    self.save_step = 0
     self.fisher_accum_steps = 1
-    self.first_save_ewc_step = -1
+    self.first_save_step = -1
     self.set_steps(hparams)
-    self.ewc_checkpoint = os.path.join(self.model_dir, hparams.ewc_checkpoint)
     if self.load_vars:
       self.load_ewc_vals()
       
+  def get_checkpoints_and_weights(self, hparams):
+    self.ewc_checkpoints = [os.path.join(self.model_dir, ckpt) 
+          for ckpt in hparams.ewc_checkpoint.split(';')]
+    self.ewc_checkpoint_to_save = os.path.join(self.model_dir, 
+                                               hparams.ewc_checkpoint_to_save)
+    try:
+      self.loss_weights = [float(weight) 
+          for weight in hparams.ewc_loss_weight.split(';')]
+    except AttributeError:
+      self.loss_weights = [float(hparams.ewc_loss_weight)]
+
   def load_ewc_vals(self):
-    with open(self.ewc_checkpoint, 'rb') as fp:
-      vals = pickle.load(fp)
-      for fisher, lag in vals:
-        self.fisher_vals.append(fisher)
-        self.lag_vals.append(lag)
+    for ckpt in self.ewc_checkpoints:
+      ckpt_fisher = []
+      ckpt_lagged = []
+      with open(ckpt, 'rb') as fp:
+        tf.logging.info('Loading lagged vals from {}'.format(ckpt))
+        vals = pickle.load(fp)
+        for fisher, lag in vals:
+          ckpt_fisher.append(fisher)
+          ckpt_lagged.append(lag)
+      self.fisher_vals.append(ckpt_fisher)
+      self.lag_vals.append(ckpt_lagged)
 
 
   def set_steps(self, hparams):
     if self.save_vars:
-      self.save_ewc_step = hparams.train_steps - hparams.ewc_fisher_accum_steps
-      tf.logging.info('Train {} steps before accumulating fisher'.format(self.save_ewc_step))
+      self.save_step = hparams.train_steps - hparams.ewc_fisher_accum_steps
+      tf.logging.info('Train {} steps before accumulating fisher'.format(self.save_step))
       self.fisher_accum_steps = hparams.ewc_fisher_accum_steps
       tf.logging.info('Then accumulate for {} steps'.format(self.fisher_accum_steps))
 
 
   def update_ewc_vals(self, *grads_vars_and_step):
     global_step = grads_vars_and_step[-1]
-    if self.first_save_ewc_step < 0:
-      self.first_save_ewc_step = self.save_ewc_step
-    last_step = (global_step >= self.first_save_ewc_step + self.fisher_accum_steps - 1)
+    if self.first_save_step < 0:
+      self.first_save_step = self.save_step
+    last_step = (global_step >= self.first_save_step + self.fisher_accum_steps - 1)
     tf.logging.debug('Updating EWC vars: step {}'.format(global_step))
     for idx, grad_var_pair in enumerate(grads_vars_and_step[:-1]):
       fisher_val = np.square(grad_var_pair[0]) / self.fisher_accum_steps
-      if idx == len(self.fisher_vals):
-        self.fisher_vals.append(fisher_val)
+      if idx == len(self.fisher_vals_to_save):
+        self.fisher_vals_to_save.append(fisher_val)
       else:
-        self.fisher_vals[idx] += fisher_val
+        self.fisher_vals_to_save[idx] += fisher_val
       if last_step:
-        self.lag_vals.append(grad_var_pair[1])
+        self.lag_vals_to_save.append(grad_var_pair[1])
     if last_step:
       tf.logging.info('Last step of accumulation: pickling EWC variables')
-      with open(self.ewc_checkpoint, 'wb') as fp:
-        pickle.dump(zip(self.fisher_vals, self.lag_vals), fp)
+      with open(self.ewc_checkpoint_to_save, 'wb') as fp:
+        pickle.dump(zip(self.fisher_vals_to_save, self.lag_vals_to_save), fp)
       sys.exit('Saved EWC vars, exiting')
     return 1
     
@@ -153,10 +171,10 @@ class EWCOptimizer(ConditionalOptimizer):
     v_list = [v for (_, v) in grads_and_vars]
     self._opt._create_slots(v_list)
     fisher_cond = tf.logical_and(tf.constant(self.save_vars, dtype=tf.bool),
-                                 tf.greater_equal(global_step, self.save_ewc_step))
+                                 tf.greater_equal(global_step, self.save_step))
     maybe_accumulate_fisher = tf.cond(fisher_cond,
-                                      lambda: self.accumulate_ewc(grads_and_vars, global_step, name=name),
-                                      lambda: self._opt.apply_gradients(grads_and_vars, global_step, name=name),
+      lambda: self.accumulate_ewc(grads_and_vars, global_step, name=name),
+      lambda: self._opt.apply_gradients(grads_and_vars, global_step, name=name),
       name=name)
     return maybe_accumulate_fisher
 
@@ -164,15 +182,19 @@ class EWCOptimizer(ConditionalOptimizer):
     tf.logging.info(t)
     return np.float32(0.0)
 
-  def get_ewc_loss(self):
-    tf.logging.info('Adding EWC penalty to loss with lambda {}'.format(self.ewc_loss_weight))
-    #for t in tf.trainable_variables():
-    #  tf.logging.info(t.name)
+  def lagged_loss(self, fisher, lagged, weight):
     if self.ignore_fisher:
       ewc_losses = [tf.reduce_sum(tf.square(l - t))
-                    for l, t in zip(self.lag_vals, tf.trainable_variables())]
+          for l, t in zip(lagged, tf.trainable_variables())]
     else:
       ewc_losses = [tf.reduce_sum(tf.square(l - t) * f)
-                    for l, t, f in zip(self.lag_vals, tf.trainable_variables(), self.fisher_vals)]
-    ewc_loss = self.ewc_loss_weight * tf.add_n(ewc_losses) 
+          for l, t, f in zip(lagged, tf.trainable_variables(), fisher)]
+    return weight * tf.add_n(ewc_losses)
+
+
+  def get_ewc_loss(self):
+    tf.logging.info('Adding EWC penalty to loss with lambda(s) {}'.format(self.loss_weights))
+    ewc_loss = 0
+    for f, l, w in zip(self.fisher_vals, self.lag_vals, self.loss_weights):
+      ewc_loss += self.lagged_loss(f, l, w)
     return ewc_loss

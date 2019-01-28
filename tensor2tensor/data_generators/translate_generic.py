@@ -289,7 +289,7 @@ def bi_vocabs_with_scaling_token_generator(source_path,
     the lines are integer lists converted from tokens in the file lines.
   """
   eos_list = [eos]
-  if scale_path:
+  if scale_path and os.path.isfile(scale_path):
     with tf.gfile.GFile(source_path, mode="r") as source_file:
       with tf.gfile.GFile(target_path, mode="r") as target_file:
         with tf.gfile.GFile(scale_path, mode="r") as scale_file:

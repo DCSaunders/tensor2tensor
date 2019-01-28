@@ -31,12 +31,15 @@ from tensor2tensor.layers import common_attention
 from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search
+from tensor2tensor.utils import decoding
+from tensor2tensor.utils import bleu_hook
 from tensor2tensor.utils import expert_utils
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
 
 import tensorflow as tf
-
+import numpy as np
+import math
 from tensorflow.python.util import nest
 
 
@@ -111,7 +114,6 @@ class Transformer(t2t_model.T2TModel):
     """
     decoder_input = tf.nn.dropout(decoder_input,
                                   1.0 - hparams.layer_prepostprocess_dropout)
-
     decoder_output = transformer_decoder(
         decoder_input,
         encoder_output,
@@ -158,7 +160,7 @@ class Transformer(t2t_model.T2TModel):
 
     decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
         targets, hparams, features=features)
-
+    
     return self.decode(decoder_input, encoder_output,
                        encoder_decoder_attention_bias,
                        decoder_self_attention_bias, hparams,
@@ -245,7 +247,6 @@ class Transformer(t2t_model.T2TModel):
       raise NotImplementedError("Fast decoding only supports a single shard.")
     dp = self._data_parallelism
     hparams = self._hparams
-
     inputs = features["inputs"]
     target_modality = self._problem_hparams.target_modality
     if target_modality.is_class_modality:
@@ -264,6 +265,7 @@ class Transformer(t2t_model.T2TModel):
     input_modality = self._problem_hparams.input_modality["inputs"]
     with tf.variable_scope(input_modality.name):
       inputs = input_modality.bottom_sharded(inputs, dp)
+
     with tf.variable_scope("body"):
       encoder_output, encoder_decoder_attention_bias = dp(
           self.encode, inputs, features["target_space_id"], hparams,
@@ -341,6 +343,14 @@ class Transformer(t2t_model.T2TModel):
         alpha=alpha)
 
 
+def hacky_print(t):
+  tf.logging.info(t)
+  return np.float32(0.0)
+
+def do_hacky_print(tensor_to_log):
+  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
+  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
+
 def fast_decode(encoder_output,
                 encoder_decoder_attention_bias,
                 symbols_to_logits_fn,
@@ -381,7 +391,6 @@ def fast_decode(encoder_output,
       }
   """
   batch_size = common_layers.shape_list(encoder_output)[0]
-
   key_channels = hparams.attention_key_channels or hparams.hidden_size
   value_channels = hparams.attention_value_channels or hparams.hidden_size
   num_layers = hparams.num_decoder_layers or hparams.num_hidden_layers
@@ -415,7 +424,7 @@ def fast_decode(encoder_output,
     else:
       decoded_ids = decoded_ids[:, :top_beams, 1:]
   else:  # Greedy
-
+    tf.logging.info('Doing greedy decoding')
     def inner_loop(i, finished, next_id, decoded_ids, cache):
       logits, cache = symbols_to_logits_fn(next_id, i, cache)
       temperature = (0.0 if hparams.sampling_method == "argmax" else
@@ -430,7 +439,7 @@ def fast_decode(encoder_output,
       return (i < decode_length) & tf.logical_not(tf.reduce_all(finished))
 
     decoded_ids = tf.zeros([batch_size, 0], dtype=tf.int64)
-    finished = tf.constant(False, shape=[batch_size])
+    finished = tf.zeros([batch_size], tf.bool)
     next_id = tf.zeros([batch_size, 1], dtype=tf.int64)
     _, _, _, decoded_ids, _ = tf.while_loop(
         is_not_finished,
@@ -444,8 +453,206 @@ def fast_decode(encoder_output,
             nest.map_structure(beam_search.get_state_shape_invariants, cache),
         ])
     scores = None
-
   return {"outputs": decoded_ids, "scores": scores}
+
+@registry.register_model
+class TransformerDiscriminative(Transformer):
+  """Transformer with discriminative training."""
+
+  def forward_pass_features(self, features):
+    transformed_features = self.bottom(features)
+    with tf.variable_scope("body", reuse=tf.AUTO_REUSE):
+      tf.logging.info("Forward pass through model body")
+      body_out = self.body(transformed_features)
+    output, losses = self._normalize_body_output(body_out)
+    return output, losses
+
+  def tile_with_adjacent_repeats(self, t, tile_num):
+    shape = common_layers.shape_list(t)
+    tiled = tf.tile(t, [1, tile_num] + [1] * (len(shape) - 2))
+    reshaped_tiled = tf.reshape(tiled, [shape[0] * tile_num] + shape[1:])
+    return reshaped_tiled
+
+  def set_features_samples_and_inputs(self, features, logits):
+    tile_num = self.hparams.greedy_sample_count
+    sample_logits = self.tile_with_adjacent_repeats(logits, tile_num)
+    samples = self.sample(sample_logits, features, tile_num)
+    sample_inputs = self.tile_with_adjacent_repeats(features['inputs'], tile_num)
+    if 'sequence_scale' in features:
+      scales = tf.tile(features['sequence_scale'], [tile_num, 1])
+      if self.hparams.mrt_use_batch_bleu:
+        scales = tf.py_func(self.batch_bleus, [samples, scales, features['targets']], tf.float32)
+      else:
+        scales = tf.py_func(self.seq_bleus, [samples, scales, features['targets']], tf.float32)
+      scales = tf.expand_dims(scales, -1)
+    if self.hparams.mrt_include_gold:
+      tf.logging.info('Appending reference to samples')
+      if 'sequence_scale' in features:
+        scales = tf.concat([features['sequence_scale'], scales], axis=0)
+      samples = tf.concat([features['targets'], samples], axis=0)
+      sample_inputs = tf.concat([features['inputs'], sample_inputs], axis=0)
+    features['sequence_scale'] = scales
+    features['targets'] = samples
+    features['inputs'] = sample_inputs
+
+  def mix_gold_sampled(self, gold_targets, sampled_targets):
+    return tf.where(
+        tf.less(
+            tf.random_uniform(common_layers.shape_list(sampled_targets)),
+            self.hparams.mrt_gold_mixin_prob), gold_targets,
+        sampled_targets)
+
+  def sample(self, logits, features, tile_num):
+    samples = common_layers.sample_with_temperature(logits, self.hparams.sampling_temp)
+    samples = tf.to_int32(samples)
+    if self.hparams.mrt_gold_mixin_prob > 0.0:
+      gold_targets = self.tile_with_adjacent_repeats(features['targets'], tile_num)
+      samples = self.mix_gold_sampled(gold_targets, samples)
+    return samples
+
+
+  def get_bleu_from_matches(self, hyp_ngrams_by_order, matches_by_order, bleu_smooth=True):
+    smooth = 1.0
+    max_order = self.hparams.mrt_bleu_max_order
+    precisions = max_order * [0.0]
+    for i in xrange(max_order):
+      if hyp_ngrams_by_order[i]:
+        if matches_by_order[i]:
+          precisions[i] = matches_by_order[i] / hyp_ngrams_by_order[i]
+        elif bleu_smooth:
+          smooth *= 2
+          precisions[i] = 1.0 / (smooth * hyp_ngrams_by_order[i])
+    bleu = math.exp(sum(math.log(p) for p in precisions if p) / max_order)
+    return bleu
+
+
+  def get_sentence_bleu(self, ref, ref_ngrams, hyp, use_bleu_bp=True):
+    max_order = self.hparams.mrt_bleu_max_order
+    matches_by_order = max_order * [0]
+    hyp_ngrams_by_order = max_order * [0]
+    self._get_ngram_matches(hyp, ref_ngrams, matches_by_order, hyp_ngrams_by_order, max_order)
+    bleu = self.get_bleu_from_matches(hyp_ngrams_by_order, matches_by_order)
+    if use_bleu_bp:
+      bleu *= self.get_bleu_bp(len(hyp), len(ref))
+    return bleu
+
+
+  def get_bleu_bp(self, hyp_len, ref_len):
+    if ref_len:
+      ratio = max(hyp_len, 1) / ref_len
+      bp = math.exp(1 - 1. / ratio) if ratio < 1.0 else 1.0
+    else:
+      bp = 1.0
+    return bp
+
+  def seq_bleus(self, samples, scales, targets):
+    for idx in range(len(targets)):
+      ref = decoding._save_until_eos(targets[idx], is_image=False)
+      ref_ngrams = bleu_hook._get_ngrams(ref, self.hparams.mrt_bleu_max_order)
+      for sample_idx in range(idx * self.hparams.greedy_sample_count,
+                              (idx + 1) * self.hparams.greedy_sample_count):
+        sample = decoding._save_until_eos(samples[sample_idx], is_image=False)
+        if not np.array_equal(sample, ref):
+          bleu = self.get_sentence_bleu(ref, ref_ngrams, sample, 
+                                        self.hparams.mrt_use_brevity_penalty)
+          scales[sample_idx] = bleu
+    scales = self._maybe_adjust_scales(scales)
+    return np.asarray(scales, dtype=np.float32)
+
+
+  def batch_bleus(self, samples, scales, targets):
+    """
+    If we have N samples per source sentence, take the N-wise sample sets and find the average set bleu metric
+    We need two quantities for our metric:
+    - The average set bleu across all N possible sets
+    - The set bleu for each possible set
+    !! this makes a lot more sense if the samples are ordered somehow !!
+    """
+    set_count = self.hparams.greedy_sample_count
+    max_order = self.hparams.mrt_bleu_max_order
+    set_matches = {idx: max_order * [0.0] for idx in range(set_count)}
+    set_hyps = {idx: max_order * [0.0] for idx in range(set_count)}
+    set_lens = {idx: 0 for idx in range(set_count)}
+    set_bleus = []
+    ref_len = 0
+    for idx in range(len(targets)):
+      ref = decoding._save_until_eos(targets[idx], is_image=False)
+      ref_ngrams = bleu_hook._get_ngrams(ref, self.hparams.mrt_bleu_max_order)
+      ref_len += len(ref)
+      sample_matches = [max_order * [0.0] for _ in range(self.hparams.greedy_sample_count)]
+      sample_hyps = [max_order * [0.0] for _ in range(self.hparams.greedy_sample_count)]
+      sample_lens = []
+      for sample_idx in range(self.hparams.greedy_sample_count):
+        complete_idx = idx * self.hparams.greedy_sample_count + sample_idx
+        sample = decoding._save_until_eos(samples[complete_idx], is_image=False)
+        if self.hparams.mrt_order_by_matches:
+          self._get_ngram_matches(sample, ref_ngrams,
+                                  sample_matches[sample_idx],
+                                  sample_hyps[sample_idx],
+                                  max_order)
+          sample_lens.append(len(sample))
+          
+        else:
+          self._get_ngram_matches(sample, ref_ngrams, set_matches[set_idx], set_hyps[set_idx],
+                                max_order)
+          set_lens[sample_idx] += len(sample)
+      if self.hparams.mrt_order_by_matches:
+        total_matches = [sum(matches) for matches in sample_matches]
+        for set_idx, (ordered_sample_idx, _) in enumerate(
+            sorted(enumerate(total_matches), key=lambda x: x[1])):
+          set_lens[set_idx] += sample_lens[ordered_sample_idx]
+          for order in range(max_order):
+            set_matches[set_idx][order] += sample_matches[ordered_sample_idx][order]
+            set_hyps[set_idx][order] += sample_hyps[ordered_sample_idx][order]
+    for set_idx in range(set_count):
+      set_bleu = self.get_bleu_from_matches(set_hyps[set_idx], set_matches[set_idx])
+      if self.hparams.mrt_use_brevity_penalty:
+        set_bleu *= self.get_bleu_bp(set_lens[set_idx], ref_len)
+      set_bleus.append(set_bleu)
+    #tf.logging.info('Set bleus (no mean reduction) {}'.format(set_bleus))
+    if self.hparams.mrt_include_gold_in_av:
+      set_bleus.append(1.0)
+      set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
+      set_bleus = set_bleus[:-1]
+    else:
+      set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
+    #tf.logging.info('Set bleus (mean reduction) {}'.format(set_bleus))
+    scales = np.tile(set_bleus, len(targets))
+    return scales
+
+  def _maybe_adjust_scales(self, scales):
+    if self.hparams.mrt_subtract_av_metric:
+      scales -= np.mean(scales)
+    else:
+      if self.hparams.mrt_use_negative_bleu:
+        scales = -scales
+      elif self.hparams.mrt_zero_bleu_high:
+        scales = 1.0 - scales
+    return scales.clip(min=0.0)
+
+
+  def _get_ngram_matches(self, hyp, ref_ngrams, matches_by_order, hyp_ngrams_by_order, max_order):
+    hyp_ngrams = bleu_hook._get_ngrams(hyp, max_order)
+    for ngram, count in hyp_ngrams.items():
+      hyp_ngrams_by_order[len(ngram) - 1] += count
+    for ngram, count in ref_ngrams.items():
+      if hyp_ngrams[ngram] > 0:
+        matches_by_order[len(ngram) - 1] += min(count, hyp_ngrams[ngram])
+
+
+
+  def model_fn(self, features):
+    output, losses = self.forward_pass_features(features)
+    logits = self.top(output, features)
+    do_sample = (self.hparams.mode == tf.estimator.ModeKeys.TRAIN)
+    if do_sample:
+      self.set_features_samples_and_inputs(features, logits)
+      output, losses = self.forward_pass_features(features)
+      second_pass_logits = self.top(output, features)
+      losses["training"] = self.loss(second_pass_logits, features)
+    else:
+      losses["training"] = self.loss(logits, features)
+    return logits, losses
 
 
 @registry.register_model

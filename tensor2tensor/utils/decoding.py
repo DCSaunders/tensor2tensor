@@ -244,8 +244,11 @@ def decode_from_file(estimator,
   targets_vocab = hparams.problems[problem_id].vocabulary["targets"]
   problem_name = FLAGS.problems.split("-")[problem_id]
   tf.logging.info("Performing decoding from a file.")
-  sorted_inputs, sorted_keys = _get_sorted_inputs(filename, decode_hp.shards,
-                                                  decode_hp.delimiter)
+  sorted_inputs, sorted_keys = _get_sorted_inputs(
+    filename, 
+    decode_hp.shards,
+    decode_hp.delimiter,
+    sample_count=hparams.greedy_sample_count)
   num_decode_batches = (len(sorted_inputs) - 1) // decode_hp.batch_size + 1
 
   def input_fn():
@@ -513,7 +516,7 @@ def show_and_save_image(img, save_path):
   plt.savefig(save_path)
 
 
-def _get_sorted_inputs(filename, num_shards=1, delimiter="\n"):
+def _get_sorted_inputs(filename, num_shards=1, delimiter="\n", sample_count=1):
   """Returning inputs sorted according to length.
 
   Args:
@@ -540,11 +543,19 @@ def _get_sorted_inputs(filename, num_shards=1, delimiter="\n"):
     # Strip the last empty line.
     if not inputs[-1]:
       inputs.pop()
+  if sample_count > 1:
+    tf.logging.info('Duplicating lines by {}'.format(sample_count))
+    duplicated = []
+    for line in inputs:
+      for i in range(sample_count):
+        duplicated.append(line)
+    inputs = duplicated
   input_lens = [(i, len(line.split())) for i, line in enumerate(inputs)]
   sorted_input_lens = sorted(input_lens, key=operator.itemgetter(1))
   # We'll need the keys to rearrange the inputs back into their original order
   sorted_keys = {}
   sorted_inputs = []
+    
   for i, (index, _) in enumerate(sorted_input_lens):
     sorted_inputs.append(inputs[index])
     sorted_keys[index] = i
