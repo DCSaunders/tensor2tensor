@@ -35,6 +35,7 @@ class LargebatchAdamOptimizer(tf.contrib.opt.LazyAdamOptimizer):
     """Like super class method, but additionally creates slots for
     the gradient accumulator `acc_grad` and the counter variable.
     """
+    tf.logging.info('Creating slots for largebatch optimizer')
     first_var = min(var_list, key=lambda x: x.name)
 
     if (self._beta1_power is None or

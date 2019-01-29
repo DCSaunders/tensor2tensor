@@ -23,7 +23,6 @@ from __future__ import print_function
 import numpy as np
 
 from tensor2tensor.utils import yellowfin
-from tensor2tensor.utils import largebatch_optimizer
 
 import tensorflow as tf
 
@@ -51,6 +50,7 @@ def optimize(loss, learning_rate, hparams, use_tpu=False):
   else:
     opt = ConditionalOptimizer(hparams.optimizer, learning_rate, hparams, use_tpu)
   if use_tpu:
+    tf.logging.info('Using TPU')
     opt = tf.contrib.tpu.CrossShardOptimizer(opt)
 
   tf.summary.scalar("learning_rate", learning_rate)
@@ -77,60 +77,6 @@ def optimize(loss, learning_rate, hparams, use_tpu=False):
       colocate_gradients_with_ops=True)
   return train_op
 
-
-class ConditionalOptimizer(tf.train.Optimizer):
-  """Conditional optimizer."""
-
-  def __init__(self, optimizer_name, lr, hparams, use_tpu=False):
-    if optimizer_name == "Adam" and use_tpu:
-      # LazyAdamOptimizer does not work on TPU
-      optimizer_name = "TrueAdam"
-
-    tf.logging.info("Using optimizer %s", optimizer_name)
-
-    if optimizer_name == "Adam":
-      # We change the default epsilon for Adam and re-scale lr.
-      # Using LazyAdam as it's much faster for large vocabulary embeddings.
-      self._opt = tf.contrib.opt.LazyAdamOptimizer(
-          lr / 500.0,
-          beta1=hparams.optimizer_adam_beta1,
-          beta2=hparams.optimizer_adam_beta2,
-          epsilon=hparams.optimizer_adam_epsilon)
-    elif optimizer_name == "LargebatchAdam":
-      self._opt = largebatch_optimizer.LargebatchAdamOptimizer(
-          lr / 500.0,
-          beta1=hparams.optimizer_adam_beta1,
-          beta2=hparams.optimizer_adam_beta2,
-          epsilon=hparams.optimizer_adam_epsilon,
-          n=hparams.largebatch_multiplier)
-    elif optimizer_name == "Momentum":
-      self._opt = tf.train.MomentumOptimizer(
-          lr,
-          momentum=hparams.optimizer_momentum_momentum,
-          use_nesterov=hparams.optimizer_momentum_nesterov)
-    elif optimizer_name == "YellowFin":
-      self._opt = yellowfin.YellowFinOptimizer(
-          learning_rate=lr, momentum=hparams.optimizer_momentum_momentum)
-    elif optimizer_name == "TrueAdam":
-      self._opt = tf.train.AdamOptimizer(
-          lr / 500.0,
-          beta1=hparams.optimizer_adam_beta1,
-          beta2=hparams.optimizer_adam_beta2,
-          epsilon=hparams.optimizer_adam_epsilon)
-    elif optimizer_name == "Adafactor":
-      self._opt = AdafactorOptimizer(lr / 500.0)
-    else:
-      self._opt = tf.contrib.layers.OPTIMIZER_CLS_NAMES[optimizer_name](lr)
-
-  def compute_gradients(self, loss, var_list=None, **kwargs):
-    return self._opt.compute_gradients(loss, var_list, **kwargs)
-
-  def apply_gradients(self, grads_and_vars, global_step=None, name=None):
-    return self._opt.apply_gradients(
-        grads_and_vars, global_step=global_step, name=name)
-
-
->>>>>>> dsaunders_v1.4.3_modified-accumulate_gradients
 def _sqrt_decay(step):
   """Decay like 1 / sqrt(step), multiplied by 500 to normalize."""
   return 500.0 / tf.sqrt(tf.maximum(step, 1.0))

@@ -25,7 +25,7 @@ import os
 import sys
 import cPickle as pickle
 from tensor2tensor.utils import yellowfin
-
+from tensor2tensor.utils import largebatch_optimizer
 import tensorflow as tf
 from tensorflow.python.util import nest
 
@@ -47,7 +47,6 @@ class ConditionalOptimizer(tf.train.Optimizer):
       optimizer_name = "TrueAdam"
 
     tf.logging.info("Using optimizer %s", optimizer_name)
-
     if optimizer_name == "Adam":
       # We change the default epsilon for Adam and re-scale lr.
       # Using LazyAdam as it's much faster for large vocabulary embeddings.
@@ -56,6 +55,13 @@ class ConditionalOptimizer(tf.train.Optimizer):
           beta1=hparams.optimizer_adam_beta1,
           beta2=hparams.optimizer_adam_beta2,
           epsilon=hparams.optimizer_adam_epsilon)
+    elif optimizer_name == "LargebatchAdam":
+      self._opt = largebatch_optimizer.LargebatchAdamOptimizer(
+          lr / 500.0,
+          beta1=hparams.optimizer_adam_beta1,
+          beta2=hparams.optimizer_adam_beta2,
+          epsilon=hparams.optimizer_adam_epsilon,
+          n=hparams.largebatch_multiplier)
     elif optimizer_name == "Momentum":
       self._opt = tf.train.MomentumOptimizer(
           lr,

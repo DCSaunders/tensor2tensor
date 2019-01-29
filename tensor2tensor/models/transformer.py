@@ -593,7 +593,7 @@ class TransformerDiscriminative(Transformer):
           sample_lens.append(len(sample))
           
         else:
-          self._get_ngram_matches(sample, ref_ngrams, set_matches[set_idx], set_hyps[set_idx],
+          self._get_ngram_matches(sample, ref_ngrams, set_matches[sample_idx], set_hyps[sample_idx],
                                 max_order)
           set_lens[sample_idx] += len(sample)
       if self.hparams.mrt_order_by_matches:
