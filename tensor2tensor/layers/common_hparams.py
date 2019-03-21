@@ -232,13 +232,23 @@ def basic_params1():
       mrt_use_batch_bleu=False,
       mrt_order_by_matches=False,
       mrt_subtract_av_metric=False,
+      mrt_scale_var_reduce=1.0,
       mrt_use_negative_bleu=False,
       mrt_zero_bleu_high=False,
       mrt_bleu_max_order=4,
       mrt_use_brevity_penalty=True,
       mrt_gold_mixin_prob=0.0,
+      mrt_floor_loss_to_zero=True,
+      mrt_scale_smoothing=True,
+      mrt_scale_factors=1.0,
+      mrt_scale_factors_by_sample_count=True,
+      mrt_use_gleu=False,
       # Set this for accumulating gradients over multiple batches
       largebatch_multiplier=1,
+      ml_multiplier=1,
+      log_training_src_trg_loss=False,
+      mrt_equal_scaling=False,
+      mrt_autoregressive_sample=False,
   )
 
 

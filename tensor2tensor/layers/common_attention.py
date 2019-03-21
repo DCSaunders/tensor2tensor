@@ -1222,6 +1222,15 @@ def grouped_attention_multihead(query_antecedent,
             max_outputs=trunc_heads)
     return o, extra_loss
 
+def do_hacky_print(tensor_to_log):                                       
+  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)      
+  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
+
+def hacky_print(t):            
+  tf.logging.info(t.shape)
+  #tf.logging.info(np.squeeze(t))                                       
+  return np.float32(0.0)                                                
+
 
 def dot_product_attention(q,
                           k,

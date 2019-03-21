@@ -142,6 +142,12 @@ class EWCOptimizer(ConditionalOptimizer):
       tf.logging.info('Train {} steps before accumulating fisher'.format(self.save_step))
       self.fisher_accum_steps = hparams.ewc_fisher_accum_steps
       tf.logging.info('Then accumulate for {} steps'.format(self.fisher_accum_steps))
+      FLAGS = tf.flags.FLAGS
+      if self.fisher_accum_steps > FLAGS.local_eval_frequency:
+        tf.logging.warning('Fisher accumulation is reset during evaluation')
+        tf.logging.warning(
+          'To accumulate for > {} steps, increase local_eval_frequency'.format(
+            FLAGS.local_eval_frequency))
 
 
   def update_ewc_vals(self, *grads_vars_and_step):

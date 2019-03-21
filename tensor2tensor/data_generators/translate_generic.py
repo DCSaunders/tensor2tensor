@@ -12,6 +12,7 @@ from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
 from tensor2tensor.data_generators import translate
+from tensor2tensor.data_generators import lm1b
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
@@ -63,6 +64,26 @@ def _compile_data(tmp_dir, datasets, filename):
 
   return filename
 
+
+def _compile_monolingual_data(tmp_dir, datasets, filename):
+  """Concatenate all `datasets` and save to `filename`."""
+  filename = os.path.join(tmp_dir, filename)
+  with tf.gfile.GFile(filename + ".trg", mode="w") as trg_resfile:
+    for dataset in datasets:
+      orig_dir = FLAGS.raw_data_dir
+      trg_filename = dataset[1]
+      trg_filepath = os.path.join(orig_dir, trg_filename)
+      is_sgm = (trg_filename.endswith("sgm"))
+      if not os.path.exists(trg_filepath):
+        raise ValueError("Can't find files %s %s." % (trg_filepath))
+      with tf.gfile.GFile(trg_filepath, mode="r") as trg_file:
+        line = trg_file.readline()
+        while line:
+          trg_resfile.write(line.strip() + "\n")
+          line = trg_file.readline()
+  return filename
+
+
 def copyVocab(orig_path, target_path):
     # Add <pad> (idx:0), <EOS> (idx:1) and <unk> (idx:2) to vocab
     with tf.gfile.GFile(target_path, mode="w") as f:
@@ -75,6 +96,56 @@ def copyVocab(orig_path, target_path):
                     f.write("%s\n" % tokens[1])
                 else:
                     f.write("%s\n" % tokens[0])
+
+@registry.register_problem
+class LanguagemodelGenericExistingVocab(lm1b.LanguagemodelLm1b32k):
+
+  @property
+  def target_vocab_name(self):
+    return "vocab.trg"
+
+  @property
+  def has_inputs(self):
+    return False
+
+  @property
+  def targeted_vocab_size(self):
+    return 32126
+
+  def generator(self, data_dir, tmp_dir, is_training):
+    """Generator for lm1b sentences.
+
+    Args:
+      data_dir: data dir.
+      tmp_dir: tmp dir.
+      is_training: a boolean.
+
+    Yields:
+      A dictionary {"inputs": [0], "targets": [<subword ids>]}
+    """
+    possible_datasets = _TRAIN_DATASETS if is_training else _TEST_DATASETS
+    datasets = [[FLAGS.raw_data_dir, [item[1]]] for item in possible_datasets]
+    target_vocab_path = os.path.join(data_dir, self.target_vocab_name)
+
+    copyVocab(os.path.join(FLAGS.raw_data_dir, _VOCABS[1]), target_vocab_path)
+    token_vocab = text_encoder.TokenTextEncoder(target_vocab_path, replace_oov="<unk>")
+    tag = "train" if is_training else "dev"
+    data_path = _compile_monolingual_data(tmp_dir, possible_datasets, "generic_tok_%s" % tag)
+    tf.logging.info("filepath = %s", data_path)
+    with tf.gfile.GFile(data_path + '.trg', mode="r") as in_file:
+      line = in_file.readline()
+      while line:
+        tokens = token_vocab.encode(line.strip()) 
+        tokens.append(EOS)
+        yield {"targets": tokens}
+        line = in_file.readline()
+
+  def feature_encoders(self, data_dir):
+    target_vocab_filename = os.path.join(data_dir, self.target_vocab_name)
+    target_encoder = text_encoder.TokenTextEncoder(target_vocab_filename, replace_oov="<unk>")
+    return {"targets": target_encoder}
+
+
 
 @registry.register_problem
 class TranslateGeneric(translate.TranslateProblem):
@@ -262,6 +333,9 @@ class TranslateGenericExistingVocabSentenceScale(TranslateGenericExistingVocab):
     scale_path = None
     if train:
       scale_path = os.path.join(FLAGS.raw_data_dir, _SCALE)
+      if not os.path.isfile(scale_path):
+        tf.logging.info('Generating default scale 1 for all sentences')
+        scale_path = None
     generator_args.append(scale_path)
     return bi_vocabs_with_scaling_token_generator(*generator_args)
 

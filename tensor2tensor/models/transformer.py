@@ -26,7 +26,6 @@ from __future__ import print_function
 # Dependency imports
 
 from six.moves import xrange  # pylint: disable=redefined-builtin
-
 from tensor2tensor.layers import common_attention
 from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
@@ -40,6 +39,8 @@ from tensor2tensor.utils import t2t_model
 import tensorflow as tf
 import numpy as np
 import math
+import copy
+import collections
 from tensorflow.python.util import nest
 
 
@@ -70,7 +71,7 @@ class Transformer(t2t_model.T2TModel):
               encodre-decoder attention. [batch_size, input_length]
     """
     inputs = common_layers.flatten4d3d(inputs)
-
+    
     encoder_input, self_attention_bias, encoder_decoder_attention_bias = (
         transformer_prepare_encoder(
             inputs, target_space, hparams, features=features))
@@ -150,11 +151,10 @@ class Transformer(t2t_model.T2TModel):
 
     inputs = features.get("inputs")
     encoder_output, encoder_decoder_attention_bias = (None, None)
-    if inputs is not None:
+    if inputs is not None and 'inputs_raw' in features:
       target_space = features["target_space_id"]
       encoder_output, encoder_decoder_attention_bias = self.encode(
           inputs, target_space, hparams, features=features)
-
     targets = features["targets"]
     targets = common_layers.flatten4d3d(targets)
 
@@ -261,6 +261,7 @@ class Transformer(t2t_model.T2TModel):
     s = common_layers.shape_list(inputs)
     inputs = tf.reshape(inputs, [s[0] * s[1], s[2], s[3], s[4]])
     # _shard_features called to ensure that the variable names match
+
     inputs = self._shard_features({"inputs": inputs})["inputs"]
     input_modality = self._problem_hparams.input_modality["inputs"]
     with tf.variable_scope(input_modality.name):
@@ -317,9 +318,8 @@ class Transformer(t2t_model.T2TModel):
       ids = ids[:, -1:]
       targets = tf.expand_dims(tf.expand_dims(ids, axis=2), axis=3)
       targets = preprocess_targets(targets, i)
-
       bias = decoder_self_attention_bias[:, :, i:i + 1, :i + 1]
-
+      bias += do_hacky_print(bias)
       with tf.variable_scope("body"):
         body_outputs = dp(
             self.decode, targets, cache["encoder_output"],
@@ -343,8 +343,144 @@ class Transformer(t2t_model.T2TModel):
         alpha=alpha)
 
 
+  def _fast_decode_nodp(self,
+                        features,
+                        decode_length,
+                        beam_size=1,
+                        top_beams=1,
+                        alpha=1.0):
+    """Fast decoding.
+
+    Implements both greedy and beam search decoding, uses beam search iff
+    beam_size > 1, otherwise beam search related arguments are ignored.
+
+    Args:
+      features: a map of string to model  features.
+      decode_length: an integer.  How many additional timesteps to decode.
+      beam_size: number of beams.
+      top_beams: an integer. How many of the beams to return.
+      alpha: Float that controls the length penalty. larger the alpha, stronger
+        the preference for slonger translations.
+
+    Returns:
+      A dict of decoding results {
+          "outputs": integer `Tensor` of decoded ids of shape
+              [batch_size, <= decode_length] if beam_size == 1 or
+              [batch_size, top_beams, <= decode_length]
+          "scores": decoding log probs from the beam search,
+              None if using greedy decoding (beam_size=1)
+      }
+
+    Raises:
+      NotImplementedError: If there are multiple data shards.
+    """
+    if self._num_datashards != 1:
+      raise NotImplementedError("Fast decoding only supports a single shard.")
+    dp = self._data_parallelism
+    hparams = self._hparams
+    inputs = features["inputs"]
+    target_modality = self._problem_hparams.target_modality
+    if target_modality.is_class_modality:
+      decode_length = 1
+    elif self.hparams.mrt_autoregressive_sample:
+      decode_length = decode_length
+    else:
+      decode_length = common_layers.shape_list(inputs)[1] + decode_length
+
+    # TODO(llion): Clean up this reshaping logic.
+    inputs = tf.expand_dims(inputs, axis=1)
+    if len(inputs.shape) < 5:
+      inputs = tf.expand_dims(inputs, axis=4)
+    s = common_layers.shape_list(inputs)
+    inputs = tf.reshape(inputs, [s[0] * s[1], s[2], s[3], s[4]])
+    # _shard_features called to ensure that the variable names match
+
+    #inputs = self._shard_features({"inputs": inputs})["inputs"]
+    input_modality = self._problem_hparams.input_modality["inputs"]
+    with tf.variable_scope(input_modality.name):
+      #inputs = input_modality.bottom_sharded(inputs, dp)
+      inputs = input_modality.bottom(inputs)
+
+    with tf.variable_scope("body"):
+      encoder_output, encoder_decoder_attention_bias = self.encode(inputs, features["target_space_id"], hparams,
+          features=features)
+
+    if hparams.pos == "timing":
+      timing_signal = common_attention.get_timing_signal_1d(
+          decode_length + 1, hparams.hidden_size)
+
+    def preprocess_targets(targets, i):
+      """Performs preprocessing steps on the targets to prepare for the decoder.
+
+      This includes:
+        - Embedding the ids.
+        - Flattening to 3D tensor.
+        - Optionally adding timing signals.
+
+      Args:
+        targets: inputs ids to the decoder. [batch_size, 1]
+        i: scalar, Step number of the decoding loop.
+
+      Returns:
+        Processed targets [batch_size, 1, hidden_dim]
+      """
+      # _shard_features called to ensure that the variable names match
+      #targets = self._shard_features({"targets": targets})["targets"]
+      with tf.variable_scope(target_modality.name):
+        #targets = target_modality.targets_bottom_sharded(targets, dp)[0]
+        targets = target_modality.targets_bottom(targets)
+      targets = common_layers.flatten4d3d(targets)
+
+      # TODO(llion): Explain! Is this even needed?
+      targets = tf.cond(
+          tf.equal(i, 0), lambda: tf.zeros_like(targets), lambda: targets)
+
+      if hparams.pos == "timing":
+        targets += timing_signal[:, i:i + 1]
+      return targets
+
+    decoder_self_attention_bias = (
+        common_attention.attention_bias_lower_triangle(decode_length))
+    if hparams.proximity_bias:
+      decoder_self_attention_bias += common_attention.attention_bias_proximal(
+          decode_length)
+
+    def symbols_to_logits_fn(ids, i, cache):
+      """Go from ids to logits for next symbol."""
+      ids = ids[:, -1:]
+      targets = tf.expand_dims(tf.expand_dims(ids, axis=2), axis=3)
+      targets = preprocess_targets(targets, i)
+      bias = decoder_self_attention_bias[:, :, i:i + 1, :i + 1]
+
+      with tf.variable_scope("body"):
+        body_outputs = self.decode(targets, cache["encoder_output"],
+            cache["encoder_decoder_attention_bias"], bias, hparams, cache,
+            nonpadding=features_to_nonpadding(features, "targets"))
+
+      with tf.variable_scope(target_modality.name):
+        logits = target_modality.top(body_outputs, None)
+
+      return tf.squeeze(logits, axis=[1, 2, 3]), cache
+
+    return fast_decode(
+        encoder_output=encoder_output,
+        encoder_decoder_attention_bias=encoder_decoder_attention_bias,
+        symbols_to_logits_fn=symbols_to_logits_fn,
+        hparams=hparams,
+        decode_length=decode_length,
+        vocab_size=target_modality.top_dimensionality,
+        beam_size=beam_size,
+        top_beams=top_beams,
+        alpha=alpha)
+
+
+
+  
+  
+
+
 def hacky_print(t):
-  tf.logging.info(t)
+  tf.logging.info(np.squeeze(t))
   return np.float32(0.0)
 
 def do_hacky_print(tensor_to_log):
@@ -451,7 +587,8 @@ def fast_decode(encoder_output,
             tf.TensorShape([None, None]),
             tf.TensorShape([None, None]),
             nest.map_structure(beam_search.get_state_shape_invariants, cache),
-        ])
+        ],
+      back_prop=False)
     scores = None
   return {"outputs": decoded_ids, "scores": scores}
 
@@ -465,7 +602,7 @@ class TransformerDiscriminative(Transformer):
       tf.logging.info("Forward pass through model body")
       body_out = self.body(transformed_features)
     output, losses = self._normalize_body_output(body_out)
-    return output, losses
+    return output, losses, transformed_features
 
   def tile_with_adjacent_repeats(self, t, tile_num):
     shape = common_layers.shape_list(t)
@@ -473,22 +610,43 @@ class TransformerDiscriminative(Transformer):
     reshaped_tiled = tf.reshape(tiled, [shape[0] * tile_num] + shape[1:])
     return reshaped_tiled
 
-  def set_features_samples_and_inputs(self, features, logits):
+  def mask_samples(self, samples, target_len):
+    pad_len = target_len
+    samples_out = []
+    for idx, sample in enumerate(samples):
+      sample = decoding._save_until_eos(sample, is_image=False)
+      padded_sample = np.zeros(pad_len)
+      padded_sample[:sample.size] = sample
+      if sample.size < pad_len:
+        padded_sample[sample.size] = 1
+      samples_out.append(padded_sample.reshape([pad_len, 1, 1]))
+    return np.asarray(samples_out, dtype=np.int32)
+
+  def get_features_samples_and_inputs(self, features, logits, transformed_features):
+    if 'sequence_scale' not in features:
+      tf.logging.warning('Discriminative training requires sequence scaling')
     tile_num = self.hparams.greedy_sample_count
-    sample_logits = self.tile_with_adjacent_repeats(logits, tile_num)
-    samples = self.sample(sample_logits, features, tile_num)
+    samples = self.sample_for_mrt(logits, features, tile_num, transformed_features)
     sample_inputs = self.tile_with_adjacent_repeats(features['inputs'], tile_num)
-    if 'sequence_scale' in features:
-      scales = tf.tile(features['sequence_scale'], [tile_num, 1])
-      if self.hparams.mrt_use_batch_bleu:
-        scales = tf.py_func(self.batch_bleus, [samples, scales, features['targets']], tf.float32)
-      else:
-        scales = tf.py_func(self.seq_bleus, [samples, scales, features['targets']], tf.float32)
+    scales = tf.tile(features['sequence_scale'], [tile_num, 1])
+    if self.hparams.mrt_use_batch_bleu:
+      scales = tf.py_func(self.batch_bleus, [samples, features['targets']], tf.float32)
+    elif self.hparams.mrt_use_gleu:
+      scales = tf.py_func(self.batch_bleus, [samples, features['targets'], features['inputs']], tf.float32)
       scales = tf.expand_dims(scales, -1)
+    elif self.hparams.mrt_equal_scaling:
+      scale = self.hparams.mrt_scale_factor
+      if self.hparams.mrt_scale_factors_by_sample_count:
+        scale /= (self.hparams.greedy_sample_count - 1)
+      scales *= scale
+    else:
+      scales = tf.py_func(self.seq_bleus, [samples, scales, features['targets']], tf.float32)
+    self.set_features_samples_and_inputs(features, scales, samples, sample_inputs)
+
+  def set_features_samples_and_inputs(self, features, scales, samples, sample_inputs):
     if self.hparams.mrt_include_gold:
       tf.logging.info('Appending reference to samples')
-      if 'sequence_scale' in features:
-        scales = tf.concat([features['sequence_scale'], scales], axis=0)
+      scales = tf.concat([features['sequence_scale'], scales], axis=0)
       samples = tf.concat([features['targets'], samples], axis=0)
       sample_inputs = tf.concat([features['inputs'], sample_inputs], axis=0)
     features['sequence_scale'] = scales
@@ -502,38 +660,55 @@ class TransformerDiscriminative(Transformer):
             self.hparams.mrt_gold_mixin_prob), gold_targets,
         sampled_targets)
 
-  def sample(self, logits, features, tile_num):
-    samples = common_layers.sample_with_temperature(logits, self.hparams.sampling_temp)
+  def sample_for_mrt(self, logits, features, tile_num, transformed_features):
+    original_targets = features['targets']
+    original_inputs = features['inputs']
+    target_shape = common_layers.shape_list(original_targets)
+    if self.hparams.mrt_autoregressive_sample:
+      self.set_mode(tf.estimator.ModeKeys.PREDICT)
+      features['targets'] = None
+      samples = self._fast_decode_nodp(features, decode_length=target_shape[1], beam_size=1, top_beams=1, alpha=0.0)
+      samples = tf.expand_dims(tf.expand_dims(samples['outputs'], -1), -1)
+      self.set_mode(tf.estimator.ModeKeys.TRAIN)
+      samples = self.tile_with_adjacent_repeats(samples, tile_num)
+    else:
+      sample_logits = self.tile_with_adjacent_repeats(logits, tile_num)
+      samples = common_layers.sample_with_temperature(sample_logits, self.hparams.sampling_temp)
     samples = tf.to_int32(samples)
     if self.hparams.mrt_gold_mixin_prob > 0.0:
-      gold_targets = self.tile_with_adjacent_repeats(features['targets'], tile_num)
+      gold_targets = self.tile_with_adjacent_repeats(original_targets, tile_num)
       samples = self.mix_gold_sampled(gold_targets, samples)
+    target_shape[0] *= tile_num
+    samples = tf.py_func(self.mask_samples, [samples, target_shape[1]], tf.int32)
+    samples = tf.reshape(samples, target_shape)
+    features['targets'] = original_targets
+    features['inputs'] = original_inputs
     return samples
 
 
-  def get_bleu_from_matches(self, hyp_ngrams_by_order, matches_by_order, bleu_smooth=True):
+  def get_bleu_from_matches(self, hyps_by_order, matches_by_order):
     smooth = 1.0
-    max_order = self.hparams.mrt_bleu_max_order
-    precisions = max_order * [0.0]
-    for i in xrange(max_order):
-      if hyp_ngrams_by_order[i]:
+    bleu_smooth = self.hparams.mrt_scale_smoothing
+    precisions = self.get_empty_max_order()
+    if not sum(hyps_by_order):
+      return 0.0
+    for i in xrange(self.hparams.mrt_bleu_max_order):
+      if hyps_by_order[i]:
         if matches_by_order[i]:
-          precisions[i] = matches_by_order[i] / hyp_ngrams_by_order[i]
+          precisions[i] = matches_by_order[i] / hyps_by_order[i]
         elif bleu_smooth:
           smooth *= 2
-          precisions[i] = 1.0 / (smooth * hyp_ngrams_by_order[i])
-    bleu = math.exp(sum(math.log(p) for p in precisions if p) / max_order)
+          precisions[i] = 1.0 / (smooth * hyps_by_order[i])
+    bleu = math.exp(sum(math.log(p) for p in precisions if p) / self.hparams.mrt_bleu_max_order)
     return bleu
 
-
-  def get_sentence_bleu(self, ref, ref_ngrams, hyp, use_bleu_bp=True):
-    max_order = self.hparams.mrt_bleu_max_order
-    matches_by_order = max_order * [0]
-    hyp_ngrams_by_order = max_order * [0]
-    self._get_ngram_matches(hyp, ref_ngrams, matches_by_order, hyp_ngrams_by_order, max_order)
+  def get_sentence_bleu(self, ref_ngrams, ref_len, hyp_ngrams, hyp_len):
+    matches_by_order = self.get_empty_max_order()
+    hyp_ngrams_by_order = self.get_empty_max_order()
+    self.ngram_matches(hyp_ngrams, ref_ngrams, matches_by_order, hyp_ngrams_by_order)
     bleu = self.get_bleu_from_matches(hyp_ngrams_by_order, matches_by_order)
-    if use_bleu_bp:
-      bleu *= self.get_bleu_bp(len(hyp), len(ref))
+    if self.hparams.mrt_use_brevity_penalty:
+      bleu *= self.get_bleu_bp(hyp_len, ref_len)
     return bleu
 
 
@@ -547,20 +722,63 @@ class TransformerDiscriminative(Transformer):
 
   def seq_bleus(self, samples, scales, targets):
     for idx in range(len(targets)):
-      ref = decoding._save_until_eos(targets[idx], is_image=False)
-      ref_ngrams = bleu_hook._get_ngrams(ref, self.hparams.mrt_bleu_max_order)
+      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(targets[idx])
       for sample_idx in range(idx * self.hparams.greedy_sample_count,
                               (idx + 1) * self.hparams.greedy_sample_count):
-        sample = decoding._save_until_eos(samples[sample_idx], is_image=False)
-        if not np.array_equal(sample, ref):
-          bleu = self.get_sentence_bleu(ref, ref_ngrams, sample, 
-                                        self.hparams.mrt_use_brevity_penalty)
-          scales[sample_idx] = bleu
+        sample_ngrams, sample_len = self.get_trimmed_ngrams_and_len(samples[sample_idx])
+        bleu = self.get_sentence_bleu(ref_ngrams, ref_len, sample_ngrams, sample_len)
+        scales[sample_idx] = bleu
     scales = self._maybe_adjust_scales(scales)
     return np.asarray(scales, dtype=np.float32)
 
+  def empty_max_order_per_set(self):
+    return [self.get_empty_max_order() for _ in range(self.hparams.greedy_sample_count)]
 
-  def batch_bleus(self, samples, scales, targets):
+  def get_empty_max_order(self):
+    return self.hparams.mrt_bleu_max_order * [0]
+
+  def get_trimmed_ngrams_and_len(self, seq):
+    trimmed_seq = decoding._save_until_eos(seq, is_image=False)
+    ngrams = bleu_hook._get_ngrams(trimmed_seq, self.hparams.mrt_bleu_max_order)
+    return ngrams, len(trimmed_seq)
+
+  def get_ordered_batch_bleus(self, samples, targets, inputs, hyps, matches, lens, sample_set_orders):
+    all_ref_len = 0
+    for target_idx in range(len(targets)):
+      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(targets[target_idx])
+      all_ref_len += ref_len
+      if inputs is not None:
+        source_ngrams, _ = self.get_trimmed_ngrams_and_len(inputs[target_idx])
+        not_src_ngrams = self.get_not_src_ngrams(ref_ngrams, source_ngrams)
+      hyp_matches = self.empty_max_order_per_set()
+      hyp_hyps = self.empty_max_order_per_set()
+      hyp_lens = []
+      for idx in range(self.hparams.greedy_sample_count):
+        untrimmed_sample = samples[target_idx * self.hparams.greedy_sample_count + idx]
+        hyp_ngrams, hyp_len = self.get_trimmed_ngrams_and_len(untrimmed_sample)
+        if self.hparams.mrt_order_by_matches:
+          self.ngram_matches(hyp_ngrams, ref_ngrams, hyp_matches[idx], hyp_hyps[idx])
+          hyp_lens.append(hyp_len)
+          if inputs is not None:
+            self.not_src_ngram_matches(hyp_ngrams, not_src_ngrams, hyp_matches[idx], hyp_hyps[idx])
+        else:
+          self.ngram_matches(hyp_ngrams, ref_ngrams, matches[idx], hyps[idx])
+          if inputs is not None:
+            self.not_src_ngram_matches(hyp_ngrams, not_src_ngrams, matches[idx], hyps[idx])
+          lens[idx] += hyp_len
+      if self.hparams.mrt_order_by_matches:
+        total_matches = [sum(m) for m in hyp_matches]
+        for set_idx, (ordered_idx, _) in enumerate(
+            sorted(enumerate(total_matches), key=lambda x: x[1])):
+          sample_set_orders[target_idx].append(ordered_idx)
+          lens[set_idx] += hyp_lens[ordered_idx]
+          for order in range(self.hparams.mrt_bleu_max_order):
+            matches[set_idx][order] += hyp_matches[ordered_idx][order]
+            hyps[set_idx][order] += hyp_hyps[ordered_idx][order]
+    return all_ref_len
+
+
+  def batch_bleus(self, samples, targets, inputs=None):
     """
     If we have N samples per source sentence, take the N-wise sample sets and find the average set bleu metric
     We need two quantities for our metric:
@@ -568,87 +786,83 @@ class TransformerDiscriminative(Transformer):
     - The set bleu for each possible set
     !! this makes a lot more sense if the samples are ordered somehow !!
     """
-    set_count = self.hparams.greedy_sample_count
-    max_order = self.hparams.mrt_bleu_max_order
-    set_matches = {idx: max_order * [0.0] for idx in range(set_count)}
-    set_hyps = {idx: max_order * [0.0] for idx in range(set_count)}
-    set_lens = {idx: 0 for idx in range(set_count)}
+    set_hyps = self.empty_max_order_per_set()
+    set_matches = self.empty_max_order_per_set()
+    set_lens = {idx: 0 for idx in range(self.hparams.greedy_sample_count)}
+    set_sample_orders = [[] for _ in range(len(targets))] # in order, for each set, id of samples corresponding to the best set, 2nd best etc
+    ref_len = self.get_ordered_batch_bleus(samples, targets, inputs, set_hyps, set_matches, set_lens, set_sample_orders)
     set_bleus = []
-    ref_len = 0
-    for idx in range(len(targets)):
-      ref = decoding._save_until_eos(targets[idx], is_image=False)
-      ref_ngrams = bleu_hook._get_ngrams(ref, self.hparams.mrt_bleu_max_order)
-      ref_len += len(ref)
-      sample_matches = [max_order * [0.0] for _ in range(self.hparams.greedy_sample_count)]
-      sample_hyps = [max_order * [0.0] for _ in range(self.hparams.greedy_sample_count)]
-      sample_lens = []
-      for sample_idx in range(self.hparams.greedy_sample_count):
-        complete_idx = idx * self.hparams.greedy_sample_count + sample_idx
-        sample = decoding._save_until_eos(samples[complete_idx], is_image=False)
-        if self.hparams.mrt_order_by_matches:
-          self._get_ngram_matches(sample, ref_ngrams,
-                                  sample_matches[sample_idx],
-                                  sample_hyps[sample_idx],
-                                  max_order)
-          sample_lens.append(len(sample))
-          
-        else:
-          self._get_ngram_matches(sample, ref_ngrams, set_matches[sample_idx], set_hyps[sample_idx],
-                                max_order)
-          set_lens[sample_idx] += len(sample)
-      if self.hparams.mrt_order_by_matches:
-        total_matches = [sum(matches) for matches in sample_matches]
-        for set_idx, (ordered_sample_idx, _) in enumerate(
-            sorted(enumerate(total_matches), key=lambda x: x[1])):
-          set_lens[set_idx] += sample_lens[ordered_sample_idx]
-          for order in range(max_order):
-            set_matches[set_idx][order] += sample_matches[ordered_sample_idx][order]
-            set_hyps[set_idx][order] += sample_hyps[ordered_sample_idx][order]
-    for set_idx in range(set_count):
+    for set_idx in range(self.hparams.greedy_sample_count):
       set_bleu = self.get_bleu_from_matches(set_hyps[set_idx], set_matches[set_idx])
       if self.hparams.mrt_use_brevity_penalty:
         set_bleu *= self.get_bleu_bp(set_lens[set_idx], ref_len)
       set_bleus.append(set_bleu)
-    #tf.logging.info('Set bleus (no mean reduction) {}'.format(set_bleus))
     if self.hparams.mrt_include_gold_in_av:
       set_bleus.append(1.0)
       set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
       set_bleus = set_bleus[:-1]
     else:
       set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
-    #tf.logging.info('Set bleus (mean reduction) {}'.format(set_bleus))
-    scales = np.tile(set_bleus, len(targets))
+    if self.hparams.mrt_order_by_matches:
+      scales = []
+      for sample_order in set_sample_orders:
+        scales.append(set_bleus[np.asarray(sample_order, dtype=np.int32)])
+      scales = np.asarray(scales)
+    else:
+      scales = np.tile(set_bleus, len(targets))
+    scales = scales.reshape([scales.size, 1])
     return scales
 
+
   def _maybe_adjust_scales(self, scales):
+    if self.hparams.mrt_use_negative_bleu:
+      scales = -scales
+    elif self.hparams.mrt_zero_bleu_high:
+      scales = 1.0 - scales
     if self.hparams.mrt_subtract_av_metric:
-      scales -= np.mean(scales)
-    else:
-      if self.hparams.mrt_use_negative_bleu:
-        scales = -scales
-      elif self.hparams.mrt_zero_bleu_high:
-        scales = 1.0 - scales
-    return scales.clip(min=0.0)
+      scales -= self.hparams.mrt_scale_var_reduce * np.mean(scales)
+    if self.hparams.mrt_floor_loss_to_zero:
+      scales = scales.clip(min=0.0)
+    tf.logging.info(scales.squeeze())
+    scales *= self.hparams.mrt_scale_factors
+    if self.hparams.mrt_scale_factors_by_sample_count:
+      scales /= (self.hparams.greedy_sample_count - 1)
+    return scales
 
 
-  def _get_ngram_matches(self, hyp, ref_ngrams, matches_by_order, hyp_ngrams_by_order, max_order):
-    hyp_ngrams = bleu_hook._get_ngrams(hyp, max_order)
+  def ngram_matches(self, hyp_ngrams, ref_ngrams, matches, hyps):
     for ngram, count in hyp_ngrams.items():
-      hyp_ngrams_by_order[len(ngram) - 1] += count
+      hyps[len(ngram) - 1] += count
     for ngram, count in ref_ngrams.items():
       if hyp_ngrams[ngram] > 0:
-        matches_by_order[len(ngram) - 1] += min(count, hyp_ngrams[ngram])
+        matches[len(ngram) - 1] += min(count, hyp_ngrams[ngram])
 
+  def get_not_src_ngrams(self, ref_ngrams, source_ngrams):
+    ref_not_source = collections.Counter()
+    for ngram, count in ref_ngrams.items():
+      if count - source_ngrams[ngram] > 0:
+        ref_not_source[ngram] = count - source_ngrams[ngram]
+    return ref_not_source
+
+  def not_src_ngram_matches(self, hyp_ngrams, ref_not_src_ngrams, matches, hyps):
+    for ngram, count in ref_not_src_ngrams.items():
+      if hyp_ngrams[ngram] > 0:
+        matches[len(ngram) - 1] += min(count, hyp_ngrams[ngram])
+      hyps[len(ngram) - 1] += count
 
 
   def model_fn(self, features):
-    output, losses = self.forward_pass_features(features)
+    output, losses, transformed_features = self.forward_pass_features(features)
     logits = self.top(output, features)
+    
     do_sample = (self.hparams.mode == tf.estimator.ModeKeys.TRAIN)
     if do_sample:
-      self.set_features_samples_and_inputs(features, logits)
-      output, losses = self.forward_pass_features(features)
+      tf.logging.info('Sampling')
+      self.get_features_samples_and_inputs(features, logits, transformed_features)
+      output, losses, _ = self.forward_pass_features(features)
+      #losses["training"] = do_hacky_print(features['targets']) + do_hacky_print(features['inputs'])
       second_pass_logits = self.top(output, features)
+      #losses["training"] += self.loss(second_pass_logits, features)
       losses["training"] = self.loss(second_pass_logits, features)
     else:
       losses["training"] = self.loss(logits, features)
@@ -726,10 +940,11 @@ def transformer_prepare_encoder(inputs, target_space, hparams, features=None):
     encoder_self_attention_bias += common_attention.attention_bias_proximal(
         common_layers.shape_list(inputs)[1])
   # Append target_space_id embedding to inputs.
-  emb_target_space = common_layers.embedding(
+  if target_space is not None:
+    emb_target_space = common_layers.embedding(
       target_space, 32, ishape_static[-1], name="target_space_embedding")
-  emb_target_space = tf.reshape(emb_target_space, [1, 1, -1])
-  encoder_input += emb_target_space
+    emb_target_space = tf.reshape(emb_target_space, [1, 1, -1])
+    encoder_input += emb_target_space
   if hparams.pos == "timing":
     if inputs_position is not None:
       encoder_input = common_attention.add_timing_signal_1d_given_position(

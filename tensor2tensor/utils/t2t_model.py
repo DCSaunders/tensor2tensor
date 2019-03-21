@@ -41,6 +41,9 @@ from tensor2tensor.utils import registry
 
 import tensorflow as tf
 import numpy as np
+np.set_printoptions(threshold=np.inf)
+np.set_printoptions(suppress=True, formatter={'float_kind':'{:f}'.format})
+
 from tensorflow.python.eager import context
 from tensorflow.python.layers import base
 from tensorflow.python.ops import variable_scope
@@ -65,7 +68,7 @@ class T2TModel(base.Layer):
 
   def __init__(self,
                hparams,
-               mode=tf.estimator.ModeKeys.TRAIN,
+                mode=tf.estimator.ModeKeys.TRAIN,
                problem_hparams=None,
                data_parallelism=None,
                decode_hparams=None):
@@ -91,7 +94,6 @@ class T2TModel(base.Layer):
     name = self.REGISTERED_NAME or default_name
     super(T2TModel, self).__init__(
         trainable=mode == tf.estimator.ModeKeys.TRAIN, name=name)
-
     #if not problem_hparams and 
     if problem_hparams is None:
       if hasattr(hparams, "problem"):
@@ -267,7 +269,7 @@ class T2TModel(base.Layer):
       return body_output
 
     target_modality = self._problem_hparams.target_modality
-    with tf.variable_scope(target_modality.name, reuse=tf.AUTO_REUSE):
+    with tf.variable_scope(target_modality.name):
       tf.logging.info("Transforming body output with %s.top",
                       target_modality.name)
       last_only = (
@@ -295,15 +297,41 @@ class T2TModel(base.Layer):
     target_modality = self._problem_hparams.target_modality
     loss_num, loss_den = target_modality.loss(logits, features["targets"])
     if len(common_layers.shape_list(loss_num)) != 0:
-      if 'sequence_scale' in features:
+      if 'sequence_scale' in features and self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
         loss_num = tf.reduce_sum(loss_num, axis=[-3, -2, -1])
-        #loss_den += do_hacky_print(loss_num)
-        #loss_den += do_hacky_print(features['sequence_scale'])
+        '''
+        loss_den += do_hacky_print(loss_num)
+        loss_den += do_hacky_print(features['sequence_scale'])
+        loss_den += do_hacky_print(features['targets'])
+        '''
         loss_num *= tf.reshape(features['sequence_scale'],
                                common_layers.shape_list(loss_num))
       loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
-
+      
+    if (self.hparams.log_training_src_trg_loss and
+        self.hparams.mode == tf.estimator.ModeKeys.TRAIN):
+      xent, weights = common_layers.padded_cross_entropy(
+        logits,
+        features['targets'],
+        label_smoothing=0.0,
+        weights_fn=target_modality.targets_weights_fn,
+        reduce_sum=False)
+      num = tf.reduce_sum(xent, axis=[-3, -2, -1])
+      denom = tf.reduce_sum(weights, axis=[-3, -2, -1])
+      src_feature_shape = common_layers.shape_list(features['inputs'])
+      src_log_shape = [src_feature_shape[0], src_feature_shape[1], 1]
+      trg_feature_shape = common_layers.shape_list(features['targets'])
+      trg_log_shape = [trg_feature_shape[0], trg_feature_shape[1], 1]
+      seq_weights = tf.reshape(num / denom, [-1, 1, 1])
+      to_log = tf.concat([tf.cast(tf.reshape(features['inputs'], src_log_shape), tf.float32),
+                          tf.cast(tf.reshape(features['targets'], trg_log_shape), tf.float32),
+                          seq_weights],
+                         axis=1)
+      loss_den += do_hacky_print(to_log)
     loss_num *= self._problem_hparams.loss_multiplier
+    if self.hparams.ml_multiplier != 1:
+      tf.logging.info('Scaling loss by {}'.format(self.hparams.ml_multiplier))
+      loss_num *= self.hparams.ml_multiplier
     return loss_num, loss_den
 
   def optimize(self, loss, num_async_replicas=1):
@@ -1191,7 +1219,7 @@ def summarize_features(features, num_shards=1):
 
 
 def hacky_print(t):
-  tf.logging.info(t)
+  tf.logging.info(t.squeeze())
   return np.float32(0.0)
 
 def do_hacky_print(tensor_to_log):
