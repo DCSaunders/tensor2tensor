@@ -295,20 +295,20 @@ class T2TModel(base.Layer):
               tf.constant(1., dtype=tf.float32))
       
     target_modality = self._problem_hparams.target_modality
-    loss_num, loss_den = target_modality.loss(logits, features["targets"])
-    if len(common_layers.shape_list(loss_num)) != 0:
-      if 'sequence_scale' in features and self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
-        loss_num = tf.reduce_sum(loss_num, axis=[-3, -2, -1])
-        '''
-        loss_den += do_hacky_print(loss_num)
-        loss_den += do_hacky_print(features['sequence_scale'])
-        loss_den += do_hacky_print(features['targets'])
-        '''
+    if 'sequence_scale' in features and self.hparams.mode == tf.estimator.ModeKeys.TRAIN:
+        xent, weights = common_layers.padded_cross_entropy(
+          logits,
+          features['targets'],
+          label_smoothing=target_modality._model_hparams.label_smoothing,
+          weights_fn=target_modality.targets_weights_fn,
+          reduce_sum=False)
+        loss_den = tf.reduce_sum(weights)
+        loss_num = tf.reduce_sum(xent, axis=[-3, -2, -1])
         loss_num *= tf.reshape(features['sequence_scale'],
                                common_layers.shape_list(loss_num))
-      loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
+        loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
       
-    if (self.hparams.log_training_src_trg_loss and
+    elif (self.hparams.log_training_src_trg_loss and
         self.hparams.mode == tf.estimator.ModeKeys.TRAIN):
       xent, weights = common_layers.padded_cross_entropy(
         logits,
@@ -327,7 +327,10 @@ class T2TModel(base.Layer):
                           tf.cast(tf.reshape(features['targets'], trg_log_shape), tf.float32),
                           seq_weights],
                          axis=1)
-      loss_den += do_hacky_print(to_log)
+      loss_den = tf.reduce_sum(denom) + do_hacky_print(to_log)
+      loss_num = tf.reduce_sum(num)
+    else:
+      loss_num, loss_den = target_modality.loss(logits, features["targets"])
     loss_num *= self._problem_hparams.loss_multiplier
     if self.hparams.ml_multiplier != 1:
       tf.logging.info('Scaling loss by {}'.format(self.hparams.ml_multiplier))
