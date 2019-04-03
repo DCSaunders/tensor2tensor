@@ -39,6 +39,7 @@ from tensor2tensor.utils import t2t_model
 import tensorflow as tf
 import numpy as np
 import math
+import pyter
 import copy
 import collections
 from tensorflow.python.util import nest
@@ -319,7 +320,6 @@ class Transformer(t2t_model.T2TModel):
       targets = tf.expand_dims(tf.expand_dims(ids, axis=2), axis=3)
       targets = preprocess_targets(targets, i)
       bias = decoder_self_attention_bias[:, :, i:i + 1, :i + 1]
-      bias += do_hacky_print(bias)
       with tf.variable_scope("body"):
         body_outputs = dp(
             self.decode, targets, cache["encoder_output"],
@@ -382,7 +382,7 @@ class Transformer(t2t_model.T2TModel):
     target_modality = self._problem_hparams.target_modality
     if target_modality.is_class_modality:
       decode_length = 1
-    elif self.hparams.mrt_autoregressive_sample:
+    elif self.hparams.mrt_autoregressive_sample or self.hparams.mrt_beam_sample:
       decode_length = decode_length
     else:
       decode_length = common_layers.shape_list(inputs)[1] + decode_length
@@ -473,136 +473,13 @@ class Transformer(t2t_model.T2TModel):
         top_beams=top_beams,
         alpha=alpha)
 
-
-
-  
-  
-
-
-def hacky_print(t):
-  tf.logging.info(np.squeeze(t))
-  return np.float32(0.0)
-
-def do_hacky_print(tensor_to_log):
-  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
-  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
-
-def fast_decode(encoder_output,
-                encoder_decoder_attention_bias,
-                symbols_to_logits_fn,
-                hparams,
-                decode_length,
-                vocab_size,
-                beam_size=1,
-                top_beams=1,
-                alpha=1.0,
-                eos_id=beam_search.EOS_ID):
-  """Given encoder output and a symbols to logits function, does fast decoding.
-
-  Implements both greedy and beam search decoding, uses beam search iff
-  beam_size > 1, otherwise beam search related arguments are ignored.
-
-  Args:
-    encoder_output: Output from encoder.
-    encoder_decoder_attention_bias: a bias tensor for use in encoder-decoder
-      attention
-    symbols_to_logits_fn: Incremental decoding; function mapping triple
-      `(ids, step, cache)` to symbol logits.
-    hparams: run hyperparameters
-    decode_length: an integer.  How many additional timesteps to decode.
-    vocab_size: Output vocabulary size.
-    beam_size: number of beams.
-    top_beams: an integer. How many of the beams to return.
-    alpha: Float that controls the length penalty. larger the alpha, stronger
-      the preference for slonger translations.
-    eos_id: End-of-sequence symbol in beam search.
-
-  Returns:
-      A dict of decoding results {
-          "outputs": integer `Tensor` of decoded ids of shape
-              [batch_size, <= decode_length] if top_beams == 1 or
-              [batch_size, top_beams, <= decode_length] otherwise
-          "scores": decoding log probs from the beam search,
-              None if using greedy decoding (beam_size=1)
-      }
-  """
-  batch_size = common_layers.shape_list(encoder_output)[0]
-  key_channels = hparams.attention_key_channels or hparams.hidden_size
-  value_channels = hparams.attention_value_channels or hparams.hidden_size
-  num_layers = hparams.num_decoder_layers or hparams.num_hidden_layers
-
-  cache = {
-      "layer_%d" % layer: {
-          "k": tf.zeros([batch_size, 0, key_channels]),
-          "v": tf.zeros([batch_size, 0, value_channels]),
-      }
-      for layer in range(num_layers)
-  }
-
-  cache["encoder_output"] = encoder_output
-  cache["encoder_decoder_attention_bias"] = encoder_decoder_attention_bias
-
-  if beam_size > 1:  # Beam Search
-    initial_ids = tf.zeros([batch_size], dtype=tf.int32)
-    decoded_ids, scores = beam_search.beam_search(
-        symbols_to_logits_fn,
-        initial_ids,
-        beam_size,
-        decode_length,
-        vocab_size,
-        alpha,
-        states=cache,
-        eos_id=eos_id,
-        stop_early=(top_beams == 1))
-
-    if top_beams == 1:
-      decoded_ids = decoded_ids[:, 0, 1:]
-    else:
-      decoded_ids = decoded_ids[:, :top_beams, 1:]
-  else:  # Greedy
-    tf.logging.info('Doing greedy decoding')
-    def inner_loop(i, finished, next_id, decoded_ids, cache):
-      logits, cache = symbols_to_logits_fn(next_id, i, cache)
-      temperature = (0.0 if hparams.sampling_method == "argmax" else
-                     hparams.sampling_temp)
-      next_id = common_layers.sample_with_temperature(logits, temperature)
-      finished |= tf.equal(next_id, eos_id)
-      next_id = tf.expand_dims(next_id, axis=1)
-      decoded_ids = tf.concat([decoded_ids, next_id], axis=1)
-      return i + 1, finished, next_id, decoded_ids, cache
-
-    def is_not_finished(i, finished, *_):
-      return (i < decode_length) & tf.logical_not(tf.reduce_all(finished))
-
-    decoded_ids = tf.zeros([batch_size, 0], dtype=tf.int64)
-    finished = tf.zeros([batch_size], tf.bool)
-    next_id = tf.zeros([batch_size, 1], dtype=tf.int64)
-    _, _, _, decoded_ids, _ = tf.while_loop(
-        is_not_finished,
-        inner_loop,
-        [tf.constant(0), finished, next_id, decoded_ids, cache],
-        shape_invariants=[
-            tf.TensorShape([]),
-            tf.TensorShape([None]),
-            tf.TensorShape([None, None]),
-            tf.TensorShape([None, None]),
-            nest.map_structure(beam_search.get_state_shape_invariants, cache),
-        ],
-      back_prop=False)
-    scores = None
-  return {"outputs": decoded_ids, "scores": scores}
-
-@registry.register_model
-class TransformerDiscriminative(Transformer):
-  """Transformer with discriminative training."""
-
   def forward_pass_features(self, features):
     transformed_features = self.bottom(features)
     with tf.variable_scope("body", reuse=tf.AUTO_REUSE):
       tf.logging.info("Forward pass through model body")
       body_out = self.body(transformed_features)
     output, losses = self._normalize_body_output(body_out)
-    return output, losses, transformed_features
+    return output, losses
 
   def tile_with_adjacent_repeats(self, t, tile_num):
     shape = common_layers.shape_list(t)
@@ -610,38 +487,49 @@ class TransformerDiscriminative(Transformer):
     reshaped_tiled = tf.reshape(tiled, [shape[0] * tile_num] + shape[1:])
     return reshaped_tiled
 
-  def mask_samples(self, samples, target_len):
-    pad_len = target_len
+  def mask_samples(self, samples, targets):
+    pad_len = len(targets[0].squeeze())
     samples_out = []
-    for idx, sample in enumerate(samples):
-      sample = decoding._save_until_eos(sample, is_image=False)
-      padded_sample = np.zeros(pad_len)
-      padded_sample[:sample.size] = sample
-      if sample.size < pad_len:
-        padded_sample[sample.size] = 1
+    for idx, unstripped_sample in enumerate(samples):
+      sample = decoding._save_until_eos(unstripped_sample, is_image=False)
+      if sum(sample) == 0 and self.hparams.mrt_beam_sample:
+        # sometimes beam search returns 0s when beams do not finish
+        # in this case just tile the target
+        padded_sample = targets[idx].squeeze()
+      else:
+        padded_sample = np.zeros(pad_len)
+        padded_sample[:sample.size] = sample
+        if sample.size < pad_len:
+          padded_sample[sample.size] = 1       
       samples_out.append(padded_sample.reshape([pad_len, 1, 1]))
+    #tf.logging.info(np.asarray(samples_out, dtype=np.int32).squeeze())
     return np.asarray(samples_out, dtype=np.int32)
 
-  def get_features_samples_and_inputs(self, features, logits, transformed_features):
+  def get_features_samples_and_inputs(self, features, logits):
     if 'sequence_scale' not in features:
       tf.logging.warning('Discriminative training requires sequence scaling')
+      batch_size = common_layers.shape_list(logits)[0]
+      features['sequence_scale'] = tf.ones([batch_size, 1], dtype=tf.float32)
     tile_num = self.hparams.greedy_sample_count
-    samples = self.sample_for_mrt(logits, features, tile_num, transformed_features)
     sample_inputs = self.tile_with_adjacent_repeats(features['inputs'], tile_num)
+    samples = self.sample_for_mrt(logits, features, tile_num, sample_inputs)
     scales = tf.tile(features['sequence_scale'], [tile_num, 1])
     if self.hparams.mrt_use_batch_bleu:
       scales = tf.py_func(self.batch_bleus, [samples, features['targets']], tf.float32)
     elif self.hparams.mrt_use_gleu:
       scales = tf.py_func(self.batch_bleus, [samples, features['targets'], features['inputs']], tf.float32)
       scales = tf.expand_dims(scales, -1)
+    elif self.hparams.mrt_use_ter:
+      scales = tf.py_func(self.get_ters, [samples, scales, features['targets']], tf.float32)
     elif self.hparams.mrt_equal_scaling:
-      scale = self.hparams.mrt_scale_factor
+      scale = self.hparams.mrt_scale_factors
       if self.hparams.mrt_scale_factors_by_sample_count:
         scale /= (self.hparams.greedy_sample_count - 1)
       scales *= scale
     else:
       scales = tf.py_func(self.seq_bleus, [samples, scales, features['targets']], tf.float32)
     self.set_features_samples_and_inputs(features, scales, samples, sample_inputs)
+
 
   def set_features_samples_and_inputs(self, features, scales, samples, sample_inputs):
     if self.hparams.mrt_include_gold:
@@ -660,26 +548,37 @@ class TransformerDiscriminative(Transformer):
             self.hparams.mrt_gold_mixin_prob), gold_targets,
         sampled_targets)
 
-  def sample_for_mrt(self, logits, features, tile_num, transformed_features):
+  def sample_for_mrt(self, logits, features, tile_num, sample_inputs):
     original_targets = features['targets']
     original_inputs = features['inputs']
     target_shape = common_layers.shape_list(original_targets)
-    if self.hparams.mrt_autoregressive_sample:
+    if self.hparams.mrt_autoregressive_sample or self.hparams.mrt_beam_sample:
       self.set_mode(tf.estimator.ModeKeys.PREDICT)
       features['targets'] = None
-      samples = self._fast_decode_nodp(features, decode_length=target_shape[1], beam_size=1, top_beams=1, alpha=0.0)
-      samples = tf.expand_dims(tf.expand_dims(samples['outputs'], -1), -1)
+      if self.hparams.mrt_autoregressive_sample:
+        features['inputs'] = sample_inputs
+        samples = self._fast_decode_nodp(
+          features, decode_length=target_shape[1], beam_size=1, top_beams=1, alpha=self.hparams.mrt_beam_alpha)
+        samples = tf.expand_dims(tf.expand_dims(samples['outputs'], -1), -1)
+      else:
+        samples = self._fast_decode_nodp(
+          features, decode_length=target_shape[1], beam_size=tile_num, top_beams=tile_num, alpha=self.hparams.mrt_beam_alpha)
+        samples = samples['outputs']
+        #samples += tf.cast(do_hacky_print(samples), tf.int32)
+        sample_shape = common_layers.shape_list(samples)
+        samples = tf.reshape(samples, [sample_shape[0] * tile_num, sample_shape[2], 1, 1])
       self.set_mode(tf.estimator.ModeKeys.TRAIN)
-      samples = self.tile_with_adjacent_repeats(samples, tile_num)
+      #samples = self.tile_with_adjacent_repeats(samples, tile_num)
     else:
       sample_logits = self.tile_with_adjacent_repeats(logits, tile_num)
       samples = common_layers.sample_with_temperature(sample_logits, self.hparams.sampling_temp)
     samples = tf.to_int32(samples)
+    gold_targets = self.tile_with_adjacent_repeats(original_targets, tile_num)
     if self.hparams.mrt_gold_mixin_prob > 0.0:
-      gold_targets = self.tile_with_adjacent_repeats(original_targets, tile_num)
       samples = self.mix_gold_sampled(gold_targets, samples)
     target_shape[0] *= tile_num
-    samples = tf.py_func(self.mask_samples, [samples, target_shape[1]], tf.int32)
+    samples = tf.py_func(self.mask_samples, [samples, gold_targets], tf.int32)
+    #samples += tf.cast(do_hacky_print(samples), tf.int32)
     samples = tf.reshape(samples, target_shape)
     features['targets'] = original_targets
     features['inputs'] = original_inputs
@@ -710,6 +609,17 @@ class TransformerDiscriminative(Transformer):
     if self.hparams.mrt_use_brevity_penalty:
       bleu *= self.get_bleu_bp(hyp_len, ref_len)
     return bleu
+
+
+  def get_ters(self, samples, scales, targets):
+    for idx in range(len(targets)):
+      ref = decoding._save_until_eos(targets[idx], is_image=False)
+      for sample_idx in range(idx * self.hparams.greedy_sample_count,
+                              (idx + 1) * self.hparams.greedy_sample_count):
+        sample = decoding._save_until_eos(samples[sample_idx], is_image=False)
+        scales[sample_idx] = pyter.ter(sample, ref)
+    scales = self._maybe_adjust_scales(scales)
+    return np.asarray(scales, dtype=np.float32)
 
 
   def get_bleu_bp(self, hyp_len, ref_len):
@@ -817,7 +727,7 @@ class TransformerDiscriminative(Transformer):
   def _maybe_adjust_scales(self, scales):
     if self.hparams.mrt_use_negative_bleu:
       scales = -scales
-    elif self.hparams.mrt_zero_bleu_high:
+    elif self.hparams.mrt_zero_bleu_high and not self.hparams.mrt_use_ter:
       scales = 1.0 - scales
     if self.hparams.mrt_subtract_av_metric:
       scales -= self.hparams.mrt_scale_var_reduce * np.mean(scales)
@@ -852,14 +762,14 @@ class TransformerDiscriminative(Transformer):
 
 
   def model_fn(self, features):
-    output, losses, transformed_features = self.forward_pass_features(features)
+    output, losses = self.forward_pass_features(features)
     logits = self.top(output, features)
     
-    do_sample = (self.hparams.mode == tf.estimator.ModeKeys.TRAIN)
+    do_sample = (self.hparams.mode == tf.estimator.ModeKeys.TRAIN and self.hparams.do_mrt)
     if do_sample:
       tf.logging.info('Sampling')
-      self.get_features_samples_and_inputs(features, logits, transformed_features)
-      output, losses, _ = self.forward_pass_features(features)
+      self.get_features_samples_and_inputs(features, logits)
+      output, losses = self.forward_pass_features(features)
       #losses["training"] = do_hacky_print(features['targets']) + do_hacky_print(features['inputs'])
       second_pass_logits = self.top(output, features)
       #losses["training"] += self.loss(second_pass_logits, features)
@@ -867,6 +777,126 @@ class TransformerDiscriminative(Transformer):
     else:
       losses["training"] = self.loss(logits, features)
     return logits, losses
+
+
+@registry.register_model
+class TransformerDiscriminative(Transformer):
+  """Transformer with discriminative training."""
+  pass
+
+def hacky_print(t):
+  tf.logging.info(np.squeeze(t))
+  return np.float32(0.0)
+
+def do_hacky_print(tensor_to_log):
+  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
+  return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
+
+def fast_decode(encoder_output,
+                encoder_decoder_attention_bias,
+                symbols_to_logits_fn,
+                hparams,
+                decode_length,
+                vocab_size,
+                beam_size=1,
+                top_beams=1,
+                alpha=1.0,
+                eos_id=beam_search.EOS_ID):
+  """Given encoder output and a symbols to logits function, does fast decoding.
+
+  Implements both greedy and beam search decoding, uses beam search iff
+  beam_size > 1, otherwise beam search related arguments are ignored.
+
+  Args:
+    encoder_output: Output from encoder.
+    encoder_decoder_attention_bias: a bias tensor for use in encoder-decoder
+      attention
+    symbols_to_logits_fn: Incremental decoding; function mapping triple
+      `(ids, step, cache)` to symbol logits.
+    hparams: run hyperparameters
+    decode_length: an integer.  How many additional timesteps to decode.
+    vocab_size: Output vocabulary size.
+    beam_size: number of beams.
+    top_beams: an integer. How many of the beams to return.
+    alpha: Float that controls the length penalty. larger the alpha, stronger
+      the preference for slonger translations.
+    eos_id: End-of-sequence symbol in beam search.
+
+  Returns:
+      A dict of decoding results {
+          "outputs": integer `Tensor` of decoded ids of shape
+              [batch_size, <= decode_length] if top_beams == 1 or
+              [batch_size, top_beams, <= decode_length] otherwise
+          "scores": decoding log probs from the beam search,
+              None if using greedy decoding (beam_size=1)
+      }
+  """
+  batch_size = common_layers.shape_list(encoder_output)[0]
+  key_channels = hparams.attention_key_channels or hparams.hidden_size
+  value_channels = hparams.attention_value_channels or hparams.hidden_size
+  num_layers = hparams.num_decoder_layers or hparams.num_hidden_layers
+
+  cache = {
+      "layer_%d" % layer: {
+          "k": tf.zeros([batch_size, 0, key_channels]),
+          "v": tf.zeros([batch_size, 0, value_channels]),
+      }
+      for layer in range(num_layers)
+  }
+
+  cache["encoder_output"] = encoder_output
+  cache["encoder_decoder_attention_bias"] = encoder_decoder_attention_bias
+
+  if beam_size > 1:  # Beam Search
+    tf.logging.info('Beginning beam search')
+    initial_ids = tf.zeros([batch_size], dtype=tf.int32)
+    decoded_ids, scores = beam_search.beam_search(
+        symbols_to_logits_fn,
+        initial_ids,
+        beam_size,
+        decode_length,
+        vocab_size,
+        alpha,
+        states=cache,
+        eos_id=eos_id,
+        stop_early=(top_beams == 1))
+
+    if top_beams == 1:
+      decoded_ids = decoded_ids[:, 0, 1:]
+    else:
+      decoded_ids = decoded_ids[:, :top_beams, 1:]
+  else:  # Greedy
+    tf.logging.info('Doing greedy decoding')
+    def inner_loop(i, finished, next_id, decoded_ids, cache):
+      logits, cache = symbols_to_logits_fn(next_id, i, cache)
+      temperature = (0.0 if hparams.sampling_method == "argmax" else
+                     hparams.sampling_temp)
+      next_id = common_layers.sample_with_temperature(logits, temperature)
+      finished |= tf.equal(next_id, eos_id)
+      next_id = tf.expand_dims(next_id, axis=1)
+      decoded_ids = tf.concat([decoded_ids, next_id], axis=1)
+      return i + 1, finished, next_id, decoded_ids, cache
+
+    def is_not_finished(i, finished, *_):
+      return (i < decode_length) & tf.logical_not(tf.reduce_all(finished))
+
+    decoded_ids = tf.zeros([batch_size, 0], dtype=tf.int64)
+    finished = tf.zeros([batch_size], tf.bool)
+    next_id = tf.zeros([batch_size, 1], dtype=tf.int64)
+    _, _, _, decoded_ids, _ = tf.while_loop(
+        is_not_finished,
+        inner_loop,
+        [tf.constant(0), finished, next_id, decoded_ids, cache],
+        shape_invariants=[
+            tf.TensorShape([]),
+            tf.TensorShape([None]),
+            tf.TensorShape([None, None]),
+            tf.TensorShape([None, None]),
+            nest.map_structure(beam_search.get_state_shape_invariants, cache),
+        ],
+      back_prop=False)
+    scores = None
+  return {"outputs": decoded_ids, "scores": scores}
 
 
 @registry.register_model
