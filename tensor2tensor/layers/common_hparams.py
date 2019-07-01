@@ -228,11 +228,13 @@ def basic_params1():
       log_all_training_losses=False,
       greedy_sample_count=1, #number of random samples per sentence
       do_mrt=False,
+      do_risk=False,
       mrt_include_gold=False,
       mrt_include_gold_in_av=False,
       mrt_use_seq_bleu=False,
       mrt_use_batch_bleu=False,
       mrt_use_ter=False,
+      mrt_use_batch_ter=False,
       mrt_order_by_matches=False,
       mrt_subtract_av_metric=False,
       mrt_scale_var_reduce=1.0,
@@ -248,12 +250,15 @@ def basic_params1():
       mrt_use_gleu=False,
       # Set this for accumulating gradients over multiple batches
       largebatch_multiplier=1,
-      ml_multiplier=1,
       log_training_src_trg_loss=False,
       mrt_equal_scaling=False,
       mrt_autoregressive_sample=False,
       mrt_beam_sample=False,
       mrt_beam_alpha=0.0,
+      mrt_softmax_temp=1.0,
+      mrt_seqscale_product=False,
+      mrt_seqscale_av=False,
+      mrt_allow_duplicates=False,
   )
 
 

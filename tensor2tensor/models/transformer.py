@@ -505,33 +505,48 @@ class Transformer(t2t_model.T2TModel):
     #tf.logging.info(np.asarray(samples_out, dtype=np.int32).squeeze())
     return np.asarray(samples_out, dtype=np.int32)
 
-  def get_features_samples_and_inputs(self, features, logits):
-    if 'sequence_scale' not in features:
-      tf.logging.warning('Discriminative training requires sequence scaling')
-      batch_size = common_layers.shape_list(logits)[0]
+  def get_features_samples_and_inputs(self, features, logits):           
+    batch_size = common_layers.shape_list(logits)[0]                     
+    if 'sequence_scale' not in features:                                 
+      tf.logging.warning('Discriminative training requires sequence scaling')                                       
       features['sequence_scale'] = tf.ones([batch_size, 1], dtype=tf.float32)
-    tile_num = self.hparams.greedy_sample_count
-    sample_inputs = self.tile_with_adjacent_repeats(features['inputs'], tile_num)
+    if self.hparams.mrt_zero_bleu_high and not self.hparams.mrt_use_ter:  
+      features['sequence_scale'] = tf.ones_like(features['sequence_scale']) - features['sequence_scale']
+    tile_num = self.hparams.greedy_sample_count                           
+    sample_inputs = self.tile_with_adjacent_repeats(features['inputs'], tile_num)    
     samples = self.sample_for_mrt(logits, features, tile_num, sample_inputs)
-    scales = tf.tile(features['sequence_scale'], [tile_num, 1])
-    if self.hparams.mrt_use_batch_bleu:
-      scales = tf.py_func(self.batch_bleus, [samples, features['targets']], tf.float32)
-    elif self.hparams.mrt_use_gleu:
-      scales = tf.py_func(self.batch_bleus, [samples, features['targets'], features['inputs']], tf.float32)
-      scales = tf.expand_dims(scales, -1)
-    elif self.hparams.mrt_use_ter:
-      scales = tf.py_func(self.get_ters, [samples, scales, features['targets']], tf.float32)
-    elif self.hparams.mrt_equal_scaling:
-      scale = self.hparams.mrt_scale_factors
-      if self.hparams.mrt_scale_factors_by_sample_count:
-        scale /= (self.hparams.greedy_sample_count - 1)
-      scales *= scale
-    else:
-      scales = tf.py_func(self.seq_bleus, [samples, scales, features['targets']], tf.float32)
-    self.set_features_samples_and_inputs(features, scales, samples, sample_inputs)
+    targets = features['targets']                                         
+    inputs = features['inputs']                                           
+    seq_scales = tf.py_func(self.seq_bleus, [samples, targets], tf.float32)
+    scales = None                                                         
+    if self.hparams.mrt_use_batch_bleu:                                   
+      scales = tf.py_func(self.batch_bleus, [samples, targets], tf.float32)          
+    elif self.hparams.mrt_use_gleu:                                       
+      scales = tf.py_func(self.batch_bleus, [samples, targets, inputs], tf.float32)  
+    elif self.hparams.mrt_use_ter:                                        
+      scales = tf.py_func(self.get_ters, [samples, targets], tf.float32)  
+    elif self.hparams.mrt_use_batch_ter:                                        
+      scales = tf.py_func(self.get_batch_ters, [samples, targets], tf.float32)  
+    elif self.hparams.mrt_equal_scaling:                                  
+      scale = self.hparams.mrt_scale_factors                              
+      if self.hparams.mrt_scale_factors_by_sample_count:                  
+        scale /= (self.hparams.greedy_sample_count - 1)                   
+      scales *= scale                                                     
+    else:                                                                 
+      scales = seq_scales                                                 
+    scales = tf.reshape(scales, [-1, 1])                                  
+    scales += tf.cast(do_hacky_print(scales), tf.float32)                 
+    scales += tf.cast(do_hacky_print(seq_scales), tf.float32)                 
+    if self.hparams.mrt_seqscale_product:                                 
+      scales = scales * seq_scales                                        
+      #scales += tf.cast(do_hacky_print(scales), tf.float32)               
+    elif self.hparams.mrt_seqscale_av:                                    
+      scales = (scales + seq_scales) / 2.0                                
+      scales += tf.cast(do_hacky_print(scales), tf.float32)               
+    self.set_features_samples_and_inputs(features, scales, samples, sample_inputs) 
 
-
-  def set_features_samples_and_inputs(self, features, scales, samples, sample_inputs):
+  def set_features_samples_and_inputs(self, features, scales, samples,
+                                      sample_inputs):
     if self.hparams.mrt_include_gold:
       tf.logging.info('Appending reference to samples')
       scales = tf.concat([features['sequence_scale'], scales], axis=0)
@@ -580,12 +595,13 @@ class Transformer(t2t_model.T2TModel):
     samples = tf.py_func(self.mask_samples, [samples, gold_targets], tf.int32)
     #samples += tf.cast(do_hacky_print(samples), tf.int32)
     samples = tf.reshape(samples, target_shape)
-    features['targets'] = original_targets
+    gold_targets = tf.reshape(gold_targets, target_shape)
+    features['targets'] = gold_targets#original_targets
     features['inputs'] = original_inputs
     return samples
 
 
-  def get_bleu_from_matches(self, hyps_by_order, matches_by_order):
+  def get_bleu_from_matches(self, hyps_by_order, matches_by_order, hyp_len, ref_len):
     smooth = 1.0
     bleu_smooth = self.hparams.mrt_scale_smoothing
     precisions = self.get_empty_max_order()
@@ -599,28 +615,86 @@ class Transformer(t2t_model.T2TModel):
           smooth *= 2
           precisions[i] = 1.0 / (smooth * hyps_by_order[i])
     bleu = math.exp(sum(math.log(p) for p in precisions if p) / self.hparams.mrt_bleu_max_order)
+    if self.hparams.mrt_use_brevity_penalty:
+      bleu *= self.get_bleu_bp(hyp_len, ref_len)
     return bleu
 
   def get_sentence_bleu(self, ref_ngrams, ref_len, hyp_ngrams, hyp_len):
     matches_by_order = self.get_empty_max_order()
     hyp_ngrams_by_order = self.get_empty_max_order()
     self.ngram_matches(hyp_ngrams, ref_ngrams, matches_by_order, hyp_ngrams_by_order)
-    bleu = self.get_bleu_from_matches(hyp_ngrams_by_order, matches_by_order)
-    if self.hparams.mrt_use_brevity_penalty:
-      bleu *= self.get_bleu_bp(hyp_len, ref_len)
+    bleu = self.get_bleu_from_matches(
+      hyp_ngrams_by_order, matches_by_order, hyp_len, ref_len)
     return bleu
 
 
-  def get_ters(self, samples, scales, targets):
-    for idx in range(len(targets)):
-      ref = decoding._save_until_eos(targets[idx], is_image=False)
-      for sample_idx in range(idx * self.hparams.greedy_sample_count,
-                              (idx + 1) * self.hparams.greedy_sample_count):
-        sample = decoding._save_until_eos(samples[sample_idx], is_image=False)
-        scales[sample_idx] = pyter.ter(sample, ref)
+  def get_ters(self, samples, targets):
+    scales = []
+    for s, t in zip(samples, targets):
+      ref = decoding._save_until_eos(t, is_image=False)        
+      sample = decoding._save_until_eos(s, is_image=False)
+      scales.append(pyter.ter(sample, ref))
     scales = self._maybe_adjust_scales(scales)
-    return np.asarray(scales, dtype=np.float32)
+    return scales
 
+
+  def get_ordered_batch_ters(self, samples, targets, edits, sample_set_orders):
+    all_ref_len = 0
+    hyp_edits = None
+    num_sets = self.hparams.greedy_sample_count
+    for idx, (s, t) in enumerate(zip(samples, targets)):
+      set_idx = idx % num_sets
+      target_idx = int(idx / num_sets)
+      ref = decoding._save_until_eos(t, is_image=False)        
+      ref_len = len(ref)
+      sample = decoding._save_until_eos(s, is_image=False)
+      num_edits = pyter.ter(sample, ref) * ref_len
+      if set_idx == 0:
+        all_ref_len += ref_len
+        hyp_edits = [0 for _ in range(num_sets)]
+      if self.hparams.mrt_order_by_matches:
+        hyp_edits[set_idx] += num_edits
+        if set_idx == num_sets - 1: # last sample for a given target
+          target_samples = samples[idx - set_idx : idx + 1]
+          self.reorder_sample_sets_ter(target_samples,
+                                       hyp_edits,
+                                       edits,
+                                       sample_set_orders,
+                                       target_idx,
+                                       ref_len)
+      else:
+        edits[set_idx] += num_edits
+    return all_ref_len
+
+  def get_batch_ters(self, samples, targets):
+    scales = []
+    num_sets = self.hparams.greedy_sample_count
+    set_edits = [0 for _ in range(num_sets)]
+    num_per_set = int(len(targets) / self.hparams.greedy_sample_count)
+    set_sample_orders = [[] for _ in range(num_per_set)]
+    ref_len = self.get_ordered_batch_ters(samples, targets, set_edits, set_sample_orders)
+    set_ters = []
+    for set_idx in range(num_sets):
+      set_ter = set_edits[set_idx] / ref_len
+      set_ters.append(set_ter)
+    if self.hparams.mrt_include_gold_in_av:
+      set_ters.append(0.0)
+      set_ters = self._maybe_adjust_scales(set_ters)
+      set_ters = set_ters[:-1]
+    else:
+      set_ters = self._maybe_adjust_scales(set_ters)
+    if self.hparams.mrt_order_by_matches:
+      scales = []
+      for sample_order in set_sample_orders:
+        reordered_scales = np.zeros_like(sample_order, dtype=np.float32)
+        for idx, l in enumerate(sample_order):
+          reordered_scales[l] = set_ters[idx]
+        scales.append(reordered_scales)
+      scales = np.asarray(scales)
+    else:
+      scales = np.tile(set_ters, num_per_set)
+    scales = scales.reshape([scales.size, 1])
+    return scales
 
   def get_bleu_bp(self, hyp_len, ref_len):
     if ref_len:
@@ -630,16 +704,15 @@ class Transformer(t2t_model.T2TModel):
       bp = 1.0
     return bp
 
-  def seq_bleus(self, samples, scales, targets):
-    for idx in range(len(targets)):
-      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(targets[idx])
-      for sample_idx in range(idx * self.hparams.greedy_sample_count,
-                              (idx + 1) * self.hparams.greedy_sample_count):
-        sample_ngrams, sample_len = self.get_trimmed_ngrams_and_len(samples[sample_idx])
-        bleu = self.get_sentence_bleu(ref_ngrams, ref_len, sample_ngrams, sample_len)
-        scales[sample_idx] = bleu
+  def seq_bleus(self, samples, targets):
+    scales = []
+    for s, t in zip(samples, targets):
+      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(t)
+      sample_ngrams, sample_len = self.get_trimmed_ngrams_and_len(s)
+      bleu = self.get_sentence_bleu(ref_ngrams, ref_len, sample_ngrams, sample_len)
+      scales.append([bleu])
     scales = self._maybe_adjust_scales(scales)
-    return np.asarray(scales, dtype=np.float32)
+    return scales
 
   def empty_max_order_per_set(self):
     return [self.get_empty_max_order() for _ in range(self.hparams.greedy_sample_count)]
@@ -652,40 +725,114 @@ class Transformer(t2t_model.T2TModel):
     ngrams = bleu_hook._get_ngrams(trimmed_seq, self.hparams.mrt_bleu_max_order)
     return ngrams, len(trimmed_seq)
 
-  def get_ordered_batch_bleus(self, samples, targets, inputs, hyps, matches, lens, sample_set_orders):
+
+  def get_ordered_batch_bleus(self, samples, targets, hyps, matches, lens,
+                              sample_set_orders):
     all_ref_len = 0
-    for target_idx in range(len(targets)):
-      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(targets[target_idx])
-      all_ref_len += ref_len
-      if inputs is not None:
-        source_ngrams, _ = self.get_trimmed_ngrams_and_len(inputs[target_idx])
-        not_src_ngrams = self.get_not_src_ngrams(ref_ngrams, source_ngrams)
-      hyp_matches = self.empty_max_order_per_set()
-      hyp_hyps = self.empty_max_order_per_set()
-      hyp_lens = []
-      for idx in range(self.hparams.greedy_sample_count):
-        untrimmed_sample = samples[target_idx * self.hparams.greedy_sample_count + idx]
-        hyp_ngrams, hyp_len = self.get_trimmed_ngrams_and_len(untrimmed_sample)
-        if self.hparams.mrt_order_by_matches:
-          self.ngram_matches(hyp_ngrams, ref_ngrams, hyp_matches[idx], hyp_hyps[idx])
-          hyp_lens.append(hyp_len)
-          if inputs is not None:
-            self.not_src_ngram_matches(hyp_ngrams, not_src_ngrams, hyp_matches[idx], hyp_hyps[idx])
-        else:
-          self.ngram_matches(hyp_ngrams, ref_ngrams, matches[idx], hyps[idx])
-          if inputs is not None:
-            self.not_src_ngram_matches(hyp_ngrams, not_src_ngrams, matches[idx], hyps[idx])
-          lens[idx] += hyp_len
+    hyp_matches = hyp_hyps = hyp_lens = None
+    num_sets = self.hparams.greedy_sample_count
+    for idx, (s, t) in enumerate(zip(samples, targets)):
+      set_idx = idx % num_sets
+      target_idx = int(idx / num_sets)
+      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(t)
+      if set_idx == 0:
+        all_ref_len += ref_len
+        hyp_matches = self.empty_max_order_per_set()
+        hyp_hyps = self.empty_max_order_per_set()
+        hyp_lens = []
+      hyp_ngrams, hyp_len = self.get_trimmed_ngrams_and_len(s)
       if self.hparams.mrt_order_by_matches:
-        total_matches = [sum(m) for m in hyp_matches]
-        for set_idx, (ordered_idx, _) in enumerate(
-            sorted(enumerate(total_matches), key=lambda x: x[1])):
-          sample_set_orders[target_idx].append(ordered_idx)
-          lens[set_idx] += hyp_lens[ordered_idx]
-          for order in range(self.hparams.mrt_bleu_max_order):
-            matches[set_idx][order] += hyp_matches[ordered_idx][order]
-            hyps[set_idx][order] += hyp_hyps[ordered_idx][order]
+        self.ngram_matches(hyp_ngrams, ref_ngrams,
+                           hyp_matches[set_idx], hyp_hyps[set_idx])
+        hyp_lens.append(hyp_len)
+        if set_idx == num_sets - 1: # last sample for a given target
+          target_samples = samples[idx - set_idx : idx + 1]
+          self.reorder_sample_sets(target_samples,
+                                   hyp_matches,
+                                   hyp_hyps,
+                                   hyp_lens,
+                                   matches,
+                                   hyps,
+                                   lens,
+                                   sample_set_orders,
+                                   target_idx,
+                                   ref_len)
+      else:
+        self.ngram_matches(hyp_ngrams, ref_ngrams, matches[set_idx], hyps[set_idx])
+        lens[set_idx] += hyp_len
     return all_ref_len
+
+  def get_ordered_batch_gleus(self, samples, targets, inputs, hyps, matches, lens,
+                              sample_set_orders):
+    all_ref_len = 0
+    hyp_matches = hyp_hyps = hyp_lens = None
+    num_sets = self.hparams.greedy_sample_count
+    for idx, (s, t) in enumerate(zip(samples, targets)):
+      set_idx = idx % num_sets
+      target_idx = int(idx / num_sets)
+      ref_ngrams, ref_len = self.get_trimmed_ngrams_and_len(t)
+      if set_idx == 0:
+        all_ref_len += ref_len
+        hyp_matches = self.empty_max_order_per_set()
+        hyp_hyps = self.empty_max_order_per_set()
+        hyp_lens = []
+      hyp_ngrams, hyp_len = self.get_trimmed_ngrams_and_len(s)
+      source_ngrams, _ = self.get_trimmed_ngrams_and_len(inputs[target_idx])
+      not_src_ngrams = self.get_not_src_ngrams(ref_ngrams, source_ngrams)
+      if self.hparams.mrt_order_by_matches:
+        self.not_src_ngram_matches(
+          hyp_ngrams, not_src_ngrams, hyp_matches[set_idx], hyp_hyps[set_idx])
+        hyp_lens.append(hyp_len)
+        if set_idx == num_sets - 1: # last sample for a given target
+          target_samples = samples[idx - set_idx : idx + 1]
+          self.reorder_sample_sets(target_samples,
+                                   hyp_matches,
+                                   hyp_hyps,
+                                   hyp_lens,
+                                   matches,
+                                   hyps,
+                                   lens,
+                                   sample_set_orders,
+                                   target_idx,
+                                   ref_len)
+      else:
+        self.not_src_ngram_matches(
+          hyp_ngrams, not_src_ngrams, matches[set_idx], hyps[set_idx])
+        lens[set_idx] += hyp_len
+    return all_ref_len
+
+
+  def reorder_sample_sets(self, samples, hyp_matches, hyp_hyps, hyp_lens,  
+                          matches, hyps, lens,
+                          sample_set_orders, target_idx, ref_len):
+    total_bleus = [self.get_bleu_from_matches(h, m, l, ref_len)
+                   for h, m, l in zip(hyp_hyps, hyp_matches, hyp_lens)]
+    if self.hparams.mrt_zero_bleu_high:
+      total_bleus = [1-b for b in total_bleus]
+    set_idx = 0
+    # go from worst bleu to best to discourage duplicates?
+    for ordered_idx, _ in sorted(enumerate(total_bleus), key=lambda x: x[1]):
+      # if sample is identical to last, use id of last set to sample_set_orders
+      """
+      if set_idx > 0 and np.all(samples[set_idx] == samples[set_idx - 1]):
+        ordered_idx = sample_set_orders[target_idx][-1]
+        set_idx -= 1
+      """
+      sample_set_orders[target_idx].append(ordered_idx)
+      lens[set_idx] += hyp_lens[ordered_idx]
+      for order in range(self.hparams.mrt_bleu_max_order):
+        matches[set_idx][order] += hyp_matches[ordered_idx][order]
+        hyps[set_idx][order] += hyp_hyps[ordered_idx][order]
+      set_idx += 1
+
+  def reorder_sample_sets_ter(self, samples, hyp_edits, edits,
+                          sample_set_orders, target_idx, ref_len):
+    set_idx = 0
+    for ordered_idx, _ in sorted(enumerate(hyp_edits), key=lambda x: x[1]):
+      # if sample is identical to last, use id of last set to sample_set_orders
+      sample_set_orders[target_idx].append(ordered_idx)
+      edits[set_idx] += hyp_edits[ordered_idx]
+      set_idx += 1
 
 
   def batch_bleus(self, samples, targets, inputs=None):
@@ -698,45 +845,54 @@ class Transformer(t2t_model.T2TModel):
     """
     set_hyps = self.empty_max_order_per_set()
     set_matches = self.empty_max_order_per_set()
-    set_lens = {idx: 0 for idx in range(self.hparams.greedy_sample_count)}
-    set_sample_orders = [[] for _ in range(len(targets))] # in order, for each set, id of samples corresponding to the best set, 2nd best etc
-    ref_len = self.get_ordered_batch_bleus(samples, targets, inputs, set_hyps, set_matches, set_lens, set_sample_orders)
+    num_sets = self.hparams.greedy_sample_count
+    num_per_set = int(len(targets) / self.hparams.greedy_sample_count)
+    set_lens = {idx: 0 for idx in range(num_sets)}
+    set_sample_orders = [[] for _ in range(num_per_set)] # in order, for each set, id of samples corresponding to the best set, 2nd best etc
+    if inputs is not None:
+      ref_len = self.get_ordered_batch_gleus(samples, targets, inputs, set_hyps, set_matches, set_lens, set_sample_orders)
+    else:
+      ref_len = self.get_ordered_batch_bleus(samples, targets, set_hyps, set_matches, set_lens, set_sample_orders)
     set_bleus = []
-    for set_idx in range(self.hparams.greedy_sample_count):
-      set_bleu = self.get_bleu_from_matches(set_hyps[set_idx], set_matches[set_idx])
-      if self.hparams.mrt_use_brevity_penalty:
-        set_bleu *= self.get_bleu_bp(set_lens[set_idx], ref_len)
+    for set_idx in range(num_sets):
+      set_bleu = self.get_bleu_from_matches(set_hyps[set_idx], set_matches[set_idx], set_lens[set_idx], ref_len)
       set_bleus.append(set_bleu)
     if self.hparams.mrt_include_gold_in_av:
       set_bleus.append(1.0)
-      set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
+      set_bleus = self._maybe_adjust_scales(set_bleus)
       set_bleus = set_bleus[:-1]
     else:
-      set_bleus = self._maybe_adjust_scales(np.asarray(set_bleus, dtype=np.float32))
+      set_bleus = self._maybe_adjust_scales(set_bleus)
     if self.hparams.mrt_order_by_matches:
+      #tf.logging.info(set_sample_orders)
       scales = []
       for sample_order in set_sample_orders:
-        scales.append(set_bleus[np.asarray(sample_order, dtype=np.int32)])
+        reordered_scales = np.zeros_like(sample_order, dtype=np.float32)
+        for idx, l in enumerate(sample_order):
+          reordered_scales[l] = set_bleus[idx]
+        scales.append(reordered_scales)
       scales = np.asarray(scales)
     else:
-      scales = np.tile(set_bleus, len(targets))
+      scales = np.tile(set_bleus, num_per_set)
     scales = scales.reshape([scales.size, 1])
     return scales
 
 
   def _maybe_adjust_scales(self, scales):
+    scales = np.asarray(scales, dtype=np.float32)
     if self.hparams.mrt_use_negative_bleu:
       scales = -scales
-    elif self.hparams.mrt_zero_bleu_high and not self.hparams.mrt_use_ter:
+    elif self.hparams.mrt_zero_bleu_high and not (self.hparams.mrt_use_ter or self.hparams.mrt_use_batch_ter):
       scales = 1.0 - scales
     if self.hparams.mrt_subtract_av_metric:
       scales -= self.hparams.mrt_scale_var_reduce * np.mean(scales)
     if self.hparams.mrt_floor_loss_to_zero:
       scales = scales.clip(min=0.0)
-    tf.logging.info(scales.squeeze())
     scales *= self.hparams.mrt_scale_factors
     if self.hparams.mrt_scale_factors_by_sample_count:
       scales /= (self.hparams.greedy_sample_count - 1)
+    if len(scales) == self.hparams.greedy_sample_count:
+      tf.logging.info(scales.squeeze())
     return scales
 
 
@@ -784,12 +940,13 @@ class TransformerDiscriminative(Transformer):
   """Transformer with discriminative training."""
   pass
 
-def hacky_print(t):
-  tf.logging.info(np.squeeze(t))
+def hacky_print(t, step):
+  tf.logging.info('step {} {}'.format(step, np.squeeze(t)))
   return np.float32(0.0)
 
 def do_hacky_print(tensor_to_log):
-  unchanged = tf.py_func(hacky_print, [tensor_to_log], tf.float32)
+  step = tf.to_float(tf.train.get_global_step())
+  unchanged = tf.py_func(hacky_print, [tensor_to_log, step], tf.float32)
   return tf.reshape(0.0 * tf.reduce_sum(unchanged), ())
 
 def fast_decode(encoder_output,
