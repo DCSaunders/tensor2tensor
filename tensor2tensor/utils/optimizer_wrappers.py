@@ -98,6 +98,7 @@ class EWCOptimizer(ConditionalOptimizer):
     self.save_vars = hparams.ewc_save_vars
     self.model_dir = hparams.model_dir
     self.get_checkpoints_and_weights(hparams)
+    self.ewc_vars_to_use = hparams.ewc_vars_to_use.split(';')
     self.lag_vals_to_save = []
     self.fisher_vals_to_save = []
     self.lag_vals = []
@@ -194,19 +195,35 @@ class EWCOptimizer(ConditionalOptimizer):
     tf.logging.info(t)
     return np.float32(0.0)
 
+  def use_var(self, v_name):
+    use = False
+    for name in self.ewc_vars_to_use:
+      if name in v_name:
+        use = True
+        break
+    tf.logging.info('Using {}: {}'.format(v_name, use))
+    return use
+
   def lagged_loss(self, fisher, lagged, weight):
-    if self.ignore_fisher:
-      ewc_losses = [tf.reduce_sum(tf.square(l - t))
-          for l, t in zip(lagged, tf.trainable_variables())]
-    else:
-      ewc_losses = [tf.reduce_sum(tf.square(l - t) * f)
-          for l, t, f in zip(lagged, tf.trainable_variables(), fisher)]
-    return weight * tf.add_n(ewc_losses)
+    """
+    EWC loss using fisher weights from a single checkpoint
+    """
+    ewc_loss = 0
+    for l, t, f in zip(lagged, tf.trainable_variables(), fisher):
+      if self.ewc_vars_to_use:
+        if not self.use_var(t.name):
+          continue
+      square_diff = tf.square(l - t)
+      if not self.ignore_fisher:
+        square_diff *= f
+      ewc_loss += tf.reduce_sum(square_diff)
+    return weight * ewc_loss
 
 
   def get_ewc_loss(self):
     tf.logging.info('Adding EWC penalty to loss with lambda(s) {}'.format(self.loss_weights))
     ewc_loss = 0
     for f, l, w in zip(self.fisher_vals, self.lag_vals, self.loss_weights):
+      # potentially goes through more than one set of fisher/lagged weights
       ewc_loss += self.lagged_loss(f, l, w)
     return ewc_loss

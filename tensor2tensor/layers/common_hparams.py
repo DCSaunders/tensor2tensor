@@ -222,6 +222,8 @@ def basic_params1():
       ewc_checkpoint_to_save='ewc_vars',
       # file (or semicolon-separated files) containing pickled ewc vars   
       ewc_checkpoint='ewc_vars',
+      # variable name fragment (or semicolon-separated name fragment list) for variables to constrain in ewc - leave blank if all.
+      ewc_vars_to_use='',
       #number of minibatches to use when recomputing Fisher diagonal for EWC
       ewc_fisher_accum_steps=200,
       ewc_ignore_fisher=False,
