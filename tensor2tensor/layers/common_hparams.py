@@ -222,8 +222,9 @@ def basic_params1():
       ewc_checkpoint_to_save='ewc_vars',
       # file (or semicolon-separated files) containing pickled ewc vars   
       ewc_checkpoint='ewc_vars',
-      # variable name fragment (or semicolon-separated name fragment list) for variables to constrain in ewc - leave blank if all.
-      ewc_vars_to_use='',
+      # variable name fragment (or semicolon-separated name fragment list) for variables to constrain in ewc - leave blank if all, can put "None" if none (and e.g. wanting to freeze)
+      ewc_vars_to_use=None,
+      ewc_vars_to_freeze=None,
       #number of minibatches to use when recomputing Fisher diagonal for EWC
       ewc_fisher_accum_steps=200,
       ewc_ignore_fisher=False,
@@ -232,7 +233,6 @@ def basic_params1():
       do_mrt=False,
       do_risk=False,
       mrt_include_gold=False,
-      mrt_include_gold_in_av=False,
       mrt_use_seq_bleu=False,
       mrt_use_batch_bleu=False,
       mrt_use_ter=False,
@@ -242,18 +242,16 @@ def basic_params1():
       mrt_scale_var_reduce=1.0,
       mrt_use_negative_bleu=False,
       mrt_zero_bleu_high=False,
-      mrt_bleu_max_order=4,
-      mrt_use_brevity_penalty=True,
       mrt_gold_mixin_prob=0.0,
       mrt_floor_loss_to_zero=True,
-      mrt_scale_smoothing=True,
       mrt_scale_factors=1.0,
       mrt_scale_factors_by_sample_count=True,
       mrt_use_gleu=False,
+      mrt_log_scales=False,
+      mrt_make_mean_one=False,
       # Set this for accumulating gradients over multiple batches
       largebatch_multiplier=1,
       log_training_src_trg_loss=False,
-      mrt_equal_scaling=False,
       mrt_autoregressive_sample=False,
       mrt_beam_sample=False,
       mrt_beam_alpha=0.0,
@@ -261,6 +259,8 @@ def basic_params1():
       mrt_seqscale_product=False,
       mrt_seqscale_av=False,
       mrt_allow_duplicates=False,
+      mrt_zero_one_scale=False,
+      sample_instance_weighting=False,
   )
 
 

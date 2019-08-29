@@ -98,7 +98,12 @@ class EWCOptimizer(ConditionalOptimizer):
     self.save_vars = hparams.ewc_save_vars
     self.model_dir = hparams.model_dir
     self.get_checkpoints_and_weights(hparams)
-    self.ewc_vars_to_use = hparams.ewc_vars_to_use.split(';')
+    self.ewc_vars_to_use = None
+    if hparams.ewc_vars_to_use is not None:
+      self.ewc_vars_to_use = hparams.ewc_vars_to_use.split(';')
+    self.vars_to_freeze = None
+    if hparams.ewc_vars_to_freeze is not None:
+      self.vars_to_freeze = hparams.ewc_vars_to_freeze.split(';')
     self.lag_vals_to_save = []
     self.fisher_vals_to_save = []
     self.lag_vals = []
@@ -180,7 +185,21 @@ class EWCOptimizer(ConditionalOptimizer):
     return control_flow_ops.group(*ewc_ops)
     
 
+  def maybe_filter_vars(self, grads_and_vars):
+    if self.vars_to_freeze:
+      out_grads_and_vars = []
+      for (g, v) in grads_and_vars:
+        if self.var_in_list(v.name, self.vars_to_freeze):
+          tf.logging.info('Freezing {}'.format(v.name))
+        else:
+          tf.logging.info('Allowing learning for {}'.format(v.name))
+          out_grads_and_vars.append((g,v))
+      return out_grads_and_vars
+    return grads_and_vars
+
+
   def apply_gradients(self, grads_and_vars, global_step=None, name=None):
+    grads_and_vars = self.maybe_filter_vars(grads_and_vars)
     v_list = [v for (_, v) in grads_and_vars]
     self._opt._create_slots(v_list)
     fisher_cond = tf.logical_and(tf.constant(self.save_vars, dtype=tf.bool),
@@ -195,14 +214,15 @@ class EWCOptimizer(ConditionalOptimizer):
     tf.logging.info(t)
     return np.float32(0.0)
 
-  def use_var(self, v_name):
-    use = False
-    for name in self.ewc_vars_to_use:
-      if name in v_name:
-        use = True
+  def var_in_list(self, v_name, subname_list):
+    """If a subname in specified list is in the variable name return true"""
+    in_list = False
+    for subname in subname_list:
+      if subname in v_name:
+        in_list = True
         break
-    tf.logging.info('Using {}: {}'.format(v_name, use))
-    return use
+    tf.logging.info('In list {}: {}'.format(v_name, in_list))
+    return in_list
 
   def lagged_loss(self, fisher, lagged, weight):
     """
@@ -211,7 +231,7 @@ class EWCOptimizer(ConditionalOptimizer):
     ewc_loss = 0
     for l, t, f in zip(lagged, tf.trainable_variables(), fisher):
       if self.ewc_vars_to_use:
-        if not self.use_var(t.name):
+        if not self.var_in_list(t.name, self.ewc_vars_to_use):
           continue
       square_diff = tf.square(l - t)
       if not self.ignore_fisher:

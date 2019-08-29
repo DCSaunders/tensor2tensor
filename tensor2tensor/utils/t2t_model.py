@@ -297,6 +297,8 @@ class T2TModel(base.Layer):
     target_modality = self._problem_hparams.target_modality
     if ('sequence_scale' in features and 
         self.hparams.mode == tf.estimator.ModeKeys.TRAIN):
+      features['sequence_scale'] = tf.py_func(
+        self.maybe_adjust_scales, [features['sequence_scale']], tf.float32)
       xent, weights = common_layers.padded_cross_entropy(
         logits,
         features['targets'],
@@ -314,11 +316,14 @@ class T2TModel(base.Layer):
         scaled_logs = tf.reshape(scaled_logs, [-1, tile_num])
         loss_num = tf.nn.softmax(
           -scaled_logs * self.hparams.mrt_softmax_temp)
-        #loss_num += do_hacky_print(loss_num) + do_hacky_print(features['sequence_scale'])
         loss_num = tf.reshape(loss_num, [-1])
         loss_den = 1.0
       else:
         loss_den = tf.reduce_sum(weights)
+
+      if self.hparams.mrt_log_scales:
+        loss_num += do_hacky_print(features['sequence_scale'])
+
       loss_num *= tf.reshape(features['sequence_scale'],
                            common_layers.shape_list(loss_num))
       loss_num = tf.reshape(tf.reduce_sum(loss_num), ())
@@ -341,7 +346,7 @@ class T2TModel(base.Layer):
                           tf.cast(tf.reshape(features['targets'], trg_log_shape), tf.float32),
                           seq_weights],
                          axis=1)
-      loss_den = tf.reduce_sum(denom) + do_hacky_print(to_log)
+      loss_den = tf.reduce_sum(denom) 
       loss_num = tf.reduce_sum(num)
     else:
       loss_num, loss_den = target_modality.loss(logits, features["targets"])
