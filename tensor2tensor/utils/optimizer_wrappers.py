@@ -23,7 +23,7 @@ from __future__ import print_function
 import numpy as np
 import os
 import sys
-import cPickle as pickle
+import pickle
 from tensor2tensor.utils import yellowfin
 
 import tensorflow as tf
